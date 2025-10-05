@@ -160,7 +160,7 @@ pub fn split_by_threads() -> impl GenericThreadPool {
 
 /// Takes two closures and *potentially* runs them in parallel. It
 /// returns a pair of the results from those closures.
-pub fn fork<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
+pub fn join<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
 where
     A: FnOnce() -> RA + Send,
     B: FnOnce() -> RB + Send,
