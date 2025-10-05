@@ -15,9 +15,15 @@ use crate::util::*;
 /// The global thread pool.
 static GLOBAL_POOL: spin::Once<ThreadPool> = spin::Once::new();
 
+#[cfg(nightly)]
+#[thread_local]
+/// The thread pool that is locally active due to [`ThreadPool::install`].
+static LOCAL_POOL: UnsafeCell<*const ThreadPool> = const { UnsafeCell::new(std::ptr::null()) };
+
+#[cfg(not(nightly))]
 thread_local! {
     /// The thread pool that is locally active due to [`ThreadPool::install`].
-    static LOCAL_POOL: UnsafeCell<*const ThreadPool> = UnsafeCell::new(std::ptr::null());
+    static LOCAL_POOL: UnsafeCell<*const ThreadPool> = const { UnsafeCell::new(std::ptr::null()) };
 }
 
 /// Determines how a thread pool will behave.
@@ -134,6 +140,17 @@ impl ThreadPool {
     pub fn install<R>(&self, f: impl FnOnce() -> R) -> R {
         unsafe {
             assert!(JoinPoint::current().is_none(), "Attempted to enter pool from within another context.");
+
+            #[cfg(nightly)] {
+                let _guard = PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
+                let previous = *LOCAL_POOL.get();
+                *LOCAL_POOL.get() = self;
+                let result = f();
+                *LOCAL_POOL.get() = previous;
+                result
+            }
+
+            #[cfg(not(nightly))]
             LOCAL_POOL.with(|x| {
                 let _guard = PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
                 let previous = *x.get();
@@ -149,6 +166,18 @@ impl ThreadPool {
     /// Initializes the global thread pool if no other pool is active.
     pub(crate) fn with_current<R>(f: impl FnOnce(&ThreadPool) -> R) -> R {
         unsafe {
+            #[cfg(nightly)] {
+                let value = &mut *LOCAL_POOL.get();
+                
+                if value.is_null() {
+                    *value = GLOBAL_POOL.call_once(|| ThreadPoolBuilder::default().build());
+                }
+
+                let pool_ptr = *value;
+                f(&*pool_ptr)
+            }
+
+            #[cfg(not(nightly))]
             LOCAL_POOL.with(|x| {
                 let value = &mut *x.get();
                 
@@ -158,7 +187,7 @@ impl ThreadPool {
 
                 let pool_ptr = *value;
                 f(&*pool_ptr)
-            })   
+            })
         }
     }
 

@@ -1,6 +1,8 @@
 #![warn(missing_docs)]
 #![allow(warnings)]
 
+#![cfg_attr(nightly, feature(thread_local))]
+
 use std::cell::UnsafeCell;
 use std::hint::unreachable_unchecked;
 use std::mem::MaybeUninit;

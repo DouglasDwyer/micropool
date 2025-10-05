@@ -11,9 +11,15 @@ use smallvec::SmallVec;
 use crate::thread_pool::ThreadPoolState;
 use crate::util::*;
 
+/// The last join point entered by this thread, if any.
+#[cfg(nightly)]
+#[thread_local]
+static CURRENT_JOIN_POINT: UnsafeCell<Option<JoinPoint>> = const { UnsafeCell::new(None) };
+
+#[cfg(not(nightly))]
 thread_local! {
     /// The last join point entered by this thread, if any.
-    static CURRENT_JOIN_POINT: UnsafeCell<Option<JoinPoint>> = UnsafeCell::new(None);
+    static CURRENT_JOIN_POINT: UnsafeCell<Option<JoinPoint>> = const { UnsafeCell::new(None) };
 }
 
 /// Tracks a point in the call stack where control flow was split across
@@ -86,11 +92,17 @@ impl JoinPoint {
 
     /// Gets the join point associated with the current context, if any.
     pub fn current() -> Option<JoinPoint> {
+        #[cfg(nightly)]
+        unsafe { (*CURRENT_JOIN_POINT.get()).clone() }
+        #[cfg(not(nightly))]
         unsafe { CURRENT_JOIN_POINT.with(|x| (*x.get()).clone()) }
     }
 
     /// Sets the join point associated with the current context, if any.
     pub fn set_current(point: Option<JoinPoint>) {
+        #[cfg(nightly)]
+        unsafe { *CURRENT_JOIN_POINT.get() = point }
+        #[cfg(not(nightly))]
         unsafe { CURRENT_JOIN_POINT.with(|x| *x.get() = point) }
     }
 
