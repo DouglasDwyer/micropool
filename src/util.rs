@@ -1,5 +1,8 @@
-
-use std::{cell::{Cell, UnsafeCell}, hint::{black_box, spin_loop, unreachable_unchecked}, marker::PhantomData, mem::MaybeUninit, ops::{ControlFlow, Deref, Index}, ptr::NonNull, sync::{atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering}, Arc}, thread::{self, available_parallelism}};
+use std::hint::{black_box, spin_loop};
+use std::ops::Deref;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::thread::{self};
 
 /// Gets the first index of `value` within `slice`, or returns [`None`] if
 /// it was not found.
@@ -13,13 +16,15 @@ pub fn index_of<T: PartialEq>(value: &T, slice: &[T]) -> Option<usize> {
 #[derive(Debug, Default)]
 pub struct Event {
     /// The version number - incremented each time the event changes.
-    version: AtomicU64
+    version: AtomicU64,
 }
 
 impl Event {
     /// Initializes a new event.
     pub const fn new() -> Self {
-        Self { version: AtomicU64::new(0) }
+        Self {
+            version: AtomicU64::new(0),
+        }
     }
 
     /// Notifies all listeners that this event has changed.
@@ -31,7 +36,10 @@ impl Event {
     /// Begins listening for changes to `self`. The event listener
     /// will block until [`Self::notify`] is called by another thread.
     pub fn listen(&self) -> EventListener<'_> {
-        EventListener { event: self, version: self.version.load(Ordering::Acquire) }
+        EventListener {
+            event: self,
+            version: self.version.load(Ordering::Acquire),
+        }
     }
 
     /// Gets the atomic address on which to wait for events.
@@ -46,18 +54,20 @@ pub struct EventListener<'a> {
     /// The event in question.
     event: &'a Event,
     /// The version number of the event when this listener was created.
-    version: u64
+    version: u64,
 }
 
 impl<'a> EventListener<'a> {
-    /// Whether [`Event::notify`] has been called at least once after this object's creation.
+    /// Whether [`Event::notify`] has been called at least once after this
+    /// object's creation.
     pub fn signaled(&self) -> bool {
         self.event.version.load(Ordering::Acquire) != self.version
     }
 
-    /// Blocks the current thread, spinning in a loop for `cycles` before falling back
-    /// to blocking with the operating system scheduler. Returns `true` only if the
-    /// thread was put to sleep by the operating system.
+    /// Blocks the current thread, spinning in a loop for `cycles` before
+    /// falling back to blocking with the operating system scheduler.
+    /// Returns `true` only if the thread was put to sleep by the operating
+    /// system.
     pub fn spin_wait(&self, cycles: usize) -> bool {
         let mut i = 0;
         while i < cycles {
@@ -74,19 +84,17 @@ impl<'a> EventListener<'a> {
         true
     }
 
-    /// Blocks the current thread. Returns when [`Event::notify`] has been called at least once
-    /// since this object's creation.
+    /// Blocks the current thread. Returns when [`Event::notify`] has been
+    /// called at least once since this object's creation.
     pub fn wait(&self) {
-        unsafe {
-            while !self.signaled() {
-                atomic_wait::wait(self.event.atomic_address(), self.version as u32);
-            }
+        while !self.signaled() {
+            atomic_wait::wait(self.event.atomic_address(), self.version as u32);
         }
     }
 }
 
-/// Ensures that the program aborts on any unhandled panic where this object is in scope.
-/// The provided message will be printed.
+/// Ensures that the program aborts on any unhandled panic where this object is
+/// in scope. The provided message will be printed.
 pub struct PanicGuard(pub &'static str);
 
 impl Drop for PanicGuard {
@@ -106,11 +114,15 @@ impl<T> ScopedRef<T> {
     /// Once `scope` completes, this function will block until all
     /// clones of the reference are dropped.
     pub fn of<R>(value: T, scope: impl FnOnce(Self) -> R) -> R {
-        let holder = ScopedHolder { ref_count: AtomicUsize::new(1), value };
+        let holder = ScopedHolder {
+            ref_count: AtomicUsize::new(1),
+            value,
+        };
         scope(ScopedRef(NonNull::from_ref(&holder)))
     }
 
-    /// Determines whether two scoped references refer to the same underlying object.
+    /// Determines whether two scoped references refer to the same underlying
+    /// object.
     pub fn ptr_eq(lhs: &Self, rhs: &Self) -> bool {
         lhs.0 == rhs.0
     }
@@ -135,7 +147,9 @@ impl<T> Deref for ScopedRef<T> {
 
 impl<T> Drop for ScopedRef<T> {
     fn drop(&mut self) {
-        unsafe { self.0.as_ref().ref_count.fetch_sub(1, Ordering::Release); }
+        unsafe {
+            self.0.as_ref().ref_count.fetch_sub(1, Ordering::Release);
+        }
     }
 }
 
@@ -144,7 +158,7 @@ struct ScopedHolder<T> {
     /// The number of active references to this holder.
     ref_count: AtomicUsize,
     /// The underlying value.
-    value: T
+    value: T,
 }
 
 impl<T> Drop for ScopedHolder<T> {

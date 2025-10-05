@@ -19,4 +19,9 @@ smallvec = { version = "1.15.1", default-features = false }
 spin = { version = "0.10.0", default-features = true } # todo remove
 
 [dev-dependencies]
+criterion = { version = "0.7.0", default-features = false }
 futures-executor = "0.3.28"
+
+[[bench]]
+name = "criterion"
+harness = false

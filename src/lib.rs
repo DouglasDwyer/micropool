@@ -1,227 +1,172 @@
-#![allow(warnings)]
 #![warn(missing_docs)]
+#![allow(warnings)]
 
-use std::{cell::{Cell, UnsafeCell}, hint::{black_box, spin_loop, unreachable_unchecked}, marker::PhantomData, mem::MaybeUninit, ops::{ControlFlow, Deref, Index}, ptr::NonNull, sync::{atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering}, Arc}, thread::{self, available_parallelism}};
+use std::cell::UnsafeCell;
+use std::hint::unreachable_unchecked;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::{self, available_parallelism, JoinHandle};
 
-use paralight::iter::{BaseParallelIterator, GenericThreadPool, ParallelIterator, ParallelSource, ParallelSourceExt};
-use smallvec::{smallvec, SmallVec};
+use paralight::iter::GenericThreadPool;
+use smallvec::SmallVec;
 
-use self::util::{Event, EventListener, PanicGuard, ScopedRef, index_of};
+use self::join_point::*;
+pub use self::thread_pool::*;
+use self::util::*;
+
+/// Internal tracking for work trees executing on a thread pool.
+mod join_point;
+
+/// The primary thread pool interface.
+mod thread_pool;
 
 /// Synchronization primitives and helper types used in the implementation.
 mod util;
 
-/// A handle to the global threadpool. This can be passed to [`paralight::iter::ParallelSourceExt::with_thread_pool`]
-/// to create parallel iterators.
-pub const GLOBAL: GlobalPool = GlobalPool;
-
-/// Determines how a thread pool will behave.
-pub struct ThreadPoolBuilder {
-    /// Threads waiting for work will spin for at least this many cycles before sleeping.
-    idle_spin_cycles: usize,
-    /// The number of threads to spawn.
-    num_threads: usize,
-    /// The function to use when spawning new threads.
-    spawn_handler: Box<dyn FnMut(usize, Box<dyn FnOnce() + Send>)>,
-}
-
-impl ThreadPoolBuilder {
-    /// Threads waiting for work will spin for at least this many cycles before sleeping.
-    pub fn idle_spin_cycles(self, idle_spin_cycles: usize) -> Self {
-        Self {
-            idle_spin_cycles,
-            ..self
-        }
-    }
-
-    /// Sets the number of threads to be used in the thread pool.
-    pub fn num_threads(self, num_threads: usize) -> Self {
-        Self {
-            num_threads,
-            ..self
-        }
-    }
-
-    /// Sets a custom function for spawning threads.
-    pub fn spawn_handler<F>(self, spawn: F) -> Self
-    where
-        F: FnMut(usize, Box<dyn FnOnce() + Send>) + 'static
-    {
-        Self {
-            spawn_handler: Box::new(spawn),
-            ..Default::default()
-        }
-    }
-
-    /// Begins the thread pool by starting all background tasks.
-    fn start(mut self) {
-        for i in 0..self.num_threads {
-            (self.spawn_handler)(i, Box::new(ThreadPoolState::worker_entrypoint));
-        }
-    }
-}
-
-impl Default for ThreadPoolBuilder {
-    fn default() -> Self {
-        Self {
-            idle_spin_cycles: 150000,
-            num_threads: available_parallelism().map(usize::from).unwrap_or(1),
-            spawn_handler: Box::new(|_, x| { thread::spawn(x); })
-        }
-    }
-}
-
-/// todo
-pub struct GlobalPool;
-
-impl GenericThreadPool for GlobalPool {
-    fn upper_bounded_pipeline<Output: Send, Accum>(
-        self,
-        input_len: usize,
-        init: impl Fn() -> Accum + Sync,
-        process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
-        finalize: impl Fn(Accum) -> Output + Sync,
-        reduce: impl Fn(Output, Output) -> Output,
-        cleanup: &(impl paralight::iter::SourceCleanup + Sync),
-    ) -> Output {
-        unsafe {
-            /*let items_per_work_unit = 16; // todo
-            let work_units = (input_len + items_per_work_unit - 1) / items_per_work_unit;
-            let bound = AtomicUsize::new(work_units);
-
-            let mut output = SmallVec::<[Output; 16]>::new();  //todo: dynamic size to keep stack const
-            output.reserve_exact(work_units);
-            let output_buffer = output.as_mut_ptr();
-
-            JoinPoint::invoke(|i| {
-                let mut accumulator = init();
-                let start = i * items_per_work_unit;
-                let end = (start + items_per_work_unit).min(bound.load(Or));
-                
-                for k in start..end {
-                    let acc = process_item(accumulator, i);
-                    accumulator = match acc {
-                        ControlFlow::Continue(acc) => acc,
-                        ControlFlow::Break(acc) => {
-                            self.bound.fetch_min(i, Ordering::Relaxed);
-                            acc
-                        }
-                    };
-                }
-
-                output_buffer.add(i).write(process_item(accumulator, i));
-            }, work_units);
-            
-            output.set_len(input_len);
-
-            reduce.accumulate(output.into_iter())*/
-            todo!()
-        }
-    }
-
-    fn iter_pipeline<Output: Send>(
-        self,
-        input_len: usize,
-        accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
-        reduce: impl paralight::iter::Accumulator<Output, Output>,
-        cleanup: &(impl paralight::iter::SourceCleanup + Sync),
-    ) -> Output {
-        unsafe {
-            let mut output = SmallVec::<[Output; 16]>::new();  //todo: dynamic size to keep stack const
-            output.reserve_exact(input_len);
-            let output_buffer = output.as_mut_ptr();
-
-            JoinPoint::invoke(|i| {
-                output_buffer.add(i).write(accum.accumulate(i..i + 1));
-            }, input_len);
-            
-            output.set_len(input_len);
-
-            reduce.accumulate(output.into_iter())
-        }
-    }
-}
-
-/// Tracks whether the global thread pool has been started.
-static THREAD_POOL_INITIALIZED: spin::Once = spin::Once::new();
-
-/// Explicitly initializes the global thread pool.
-/// This function will panic if the global pool was already created.
+/// Execute [`paralight`] iterators with maximal parallelism.
+/// Every iterator item may be processed on a separate thread.
 /// 
-/// Note that, if this function is _not_ called, the global pool will
-/// be implicitly created with default settings when it is first used.
-pub fn init(builder: ThreadPoolBuilder) {
-    let mut run = false;
+/// Note: by maximizing parallelism, this also maximizes overhead.
+/// This is best used with computationally-heavy iterators that have few elements.
+/// For alternatives, see [`split_per`], [`split_by`], and [`split_by_threads`].
+pub fn split_per_item() -> impl GenericThreadPool {
+    struct SplitPerItem;
 
-    THREAD_POOL_INITIALIZED.call_once(|| {
-        builder.start();
-        run = true;
-    });
-
-    if !run {
-        panic!("micropool::init called after thread pool was active");
-    }
-}
-
-#[derive(Default)]
-struct ThreadPoolState {
-    /// An event that is invoked whenever new work is available.
-    on_change: Event,
-    /// Join points where pool threads should look for work.
-    roots: spin::RwLock<Vec<JoinPoint>>
-}
-
-impl ThreadPoolState {
-    /// Gets a reference to the global pool state. Ensures that the global thread pool
-    /// has been initialized.
-    pub fn global() -> &'static Self {
-        /// The inner state object.
-        static STATE: ThreadPoolState = ThreadPoolState::new();
-        THREAD_POOL_INITIALIZED.call_once(|| ThreadPoolBuilder::default().start());
-        &STATE
-    }
-
-    /// Creates a new state object.
-    pub const fn new() -> Self {
-        Self {
-            on_change: Event::new(),
-            roots: spin::RwLock::new(Vec::new())
+    impl GenericThreadPool for SplitPerItem {
+        fn upper_bounded_pipeline<Output: Send, Accum>(
+            self,
+            input_len: usize,
+            init: impl Fn() -> Accum + Sync,
+            process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+            finalize: impl Fn(Accum) -> Output + Sync,
+            reduce: impl Fn(Output, Output) -> Output,
+            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+        ) -> Output {
+            ThreadPool::with_current(|f| f.split_per_item().upper_bounded_pipeline(input_len, init, process_item, finalize, reduce, cleanup))
+        }
+    
+        fn iter_pipeline<Output: Send>(
+            self,
+            input_len: usize,
+            accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
+            reduce: impl paralight::iter::Accumulator<Output, Output>,
+            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+        ) -> Output {
+            ThreadPool::with_current(|f| f.split_per_item().iter_pipeline(input_len, accum, reduce, cleanup))
         }
     }
 
-    /// Enters this pool as a worker thread.
-    pub fn worker_entrypoint() {
-        Self::global().join();
-    }
-
-    /// Polls for available work on the thread pool, and goes to sleep if none is available.
-    fn join(&self) {
-        assert!(JoinPoint::current().is_none(), "Attempted to enter pool from within another context");
-        
-        let mut spin_before_sleep = false;
-
-        loop {
-            let listener = self.on_change.listen();
-            let item = JoinPoint::select_work_unit_from(&self.roots.read());
-
-            if let Some((point, i)) = item {
-                spin_before_sleep = true;
-                JoinPoint::set_current(Some(point.clone()));
-                unsafe { point.invoke_work_unit(i); }
-                point.join_work();
-                JoinPoint::set_current(None);
-            }
-            else {
-                // Only spin if something was found to do since the last sleep
-                let spin_cycles = if spin_before_sleep { todo!() } else { 0 };
-                spin_before_sleep = !listener.spin_wait(spin_cycles);
-            }
-        }
-    }
+    SplitPerItem
 }
 
-unsafe impl Send for ThreadPoolState {}
-unsafe impl Sync for ThreadPoolState {}
+/// Execute [`paralight`] iterators by batching elements.
+/// Each group of `chunk_size` elements may be processed by a single thread.
+pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
+    struct ThreadPerChunk(usize);
+
+    impl GenericThreadPool for ThreadPerChunk {
+        fn upper_bounded_pipeline<Output: Send, Accum>(
+            self,
+            input_len: usize,
+            init: impl Fn() -> Accum + Sync,
+            process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+            finalize: impl Fn(Accum) -> Output + Sync,
+            reduce: impl Fn(Output, Output) -> Output,
+            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+        ) -> Output {
+            ThreadPool::with_current(|f| f.split_by(self.0).upper_bounded_pipeline(input_len, init, process_item, finalize, reduce, cleanup))
+        }
+    
+        fn iter_pipeline<Output: Send>(
+            self,
+            input_len: usize,
+            accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
+            reduce: impl paralight::iter::Accumulator<Output, Output>,
+            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+        ) -> Output {
+            ThreadPool::with_current(|f| f.split_by(self.0).iter_pipeline(input_len, accum, reduce, cleanup))
+        }
+    }
+
+    ThreadPerChunk(chunk_size)
+}
+
+/// Execute [`paralight`] iterators by batching elements.
+/// Every iterator will be broken up into `chunks`
+/// separate work units, which may be processed in parallel.
+pub fn split_by(chunks: usize) -> impl GenericThreadPool {
+    struct Chunks(usize);
+
+    impl GenericThreadPool for Chunks {
+        fn upper_bounded_pipeline<Output: Send, Accum>(
+            self,
+            input_len: usize,
+            init: impl Fn() -> Accum + Sync,
+            process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+            finalize: impl Fn(Accum) -> Output + Sync,
+            reduce: impl Fn(Output, Output) -> Output,
+            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+        ) -> Output {
+            ThreadPool::with_current(|f| f.split_by(self.0).upper_bounded_pipeline(input_len, init, process_item, finalize, reduce, cleanup))
+        }
+    
+        fn iter_pipeline<Output: Send>(
+            self,
+            input_len: usize,
+            accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
+            reduce: impl paralight::iter::Accumulator<Output, Output>,
+            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+        ) -> Output {
+            ThreadPool::with_current(|f| f.split_by(self.0).iter_pipeline(input_len, accum, reduce, cleanup))
+        }
+    }
+
+    Chunks(chunks)
+}
+
+/// Execute [`paralight`] iterators by batching elements.
+/// Every iterator will be broken up into `N` separate work units,
+/// where `N` is the number of pool threads. Each unit may be processed in parallel.
+pub fn split_by_threads() -> impl GenericThreadPool {
+    struct SplitByThreads;
+
+    impl GenericThreadPool for SplitByThreads {
+        fn upper_bounded_pipeline<Output: Send, Accum>(
+            self,
+            input_len: usize,
+            init: impl Fn() -> Accum + Sync,
+            process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+            finalize: impl Fn(Accum) -> Output + Sync,
+            reduce: impl Fn(Output, Output) -> Output,
+            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+        ) -> Output {
+            ThreadPool::with_current(|f| f.split_by_threads().upper_bounded_pipeline(input_len, init, process_item, finalize, reduce, cleanup))
+        }
+    
+        fn iter_pipeline<Output: Send>(
+            self,
+            input_len: usize,
+            accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
+            reduce: impl paralight::iter::Accumulator<Output, Output>,
+            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+        ) -> Output {
+            ThreadPool::with_current(|f| f.split_by_threads().iter_pipeline(input_len, accum, reduce, cleanup))
+        }
+    }
+
+    SplitByThreads
+}
+
+
+/*
+
+TODO:
+- Make thread pool global
+- Have options per-iterator via thread pool customization
+
+
+*/
 
 /// Takes two closures and *potentially* runs them in parallel. It
 /// returns a pair of the results from those closures.
@@ -230,7 +175,8 @@ where
     A: FnOnce() -> RA + Send,
     B: FnOnce() -> RB + Send,
     RA: Send,
-    RB: Send {
+    RB: Send,
+{
     unsafe {
         let oper_a_holder = MaybeUninit::new(oper_a);
         let oper_b_holder = MaybeUninit::new(oper_b);
@@ -238,260 +184,242 @@ where
         let result_a = UnsafeCell::new(MaybeUninit::uninit());
         let result_b = UnsafeCell::new(MaybeUninit::uninit());
 
-        JoinPoint::invoke(|i| match i {
-            0 => { (*result_a.get()).write(oper_a_holder.assume_init_read()()); },
-            1 => { (*result_b.get()).write(oper_b_holder.assume_init_read()()); },
-            _ => unreachable_unchecked()
-        }, 2);
-
-        (result_a.into_inner().assume_init(), result_b.into_inner().assume_init())
-    }
-}
-
-thread_local! {
-    /// The last join point entered by this thread, if any.
-    static CURRENT_JOIN_POINT: UnsafeCell<Option<JoinPoint>> = UnsafeCell::new(None);
-}
-
-/// Tracks a point in the call stack where control flow was split across multiple threads.
-#[derive(Clone)]
-struct JoinPoint(ScopedRef<JoinPointInner>);
-
-impl JoinPoint {
-    /// The amount of space to reserve for child pointers.
-    const CHILD_LIST_CAPACITY: usize = 32;
-
-    /// Calls `f` with values `0..total_invocations` in parallel.
-    /// 
-    /// # Safety
-    /// 
-    /// The function `f` must be safe to call from multiple threads in parallel.
-    /// That is, it should be [`Sync`], but the bound is elided here for convenience.
-    pub unsafe fn invoke(f: impl Fn(usize), times: usize) {
-        unsafe {
-            match times {
-                0 => {},
-                1 => f(0),
-                _ => {
-                    let maybe_on_change = Event::new();
-                    let parent = Self::current();
-
-                    ScopedRef::of(JoinPointInner {
-                        children: spin::RwLock::new(SmallVec::new()),
-                        completed_invocations: AtomicU64::new(0),
-                        func: &f as *const _ as *const _,
-                        on_change: parent.as_ref().map(|x| x.0.on_change).unwrap_or(&maybe_on_change),
-                        parent,
-                        started_invocations: AtomicU64::new(1),
-                        total_invocations: times as u64
-                    }, |inner| {
-                        let join_point = JoinPoint(inner);
-
-                        let pool_state = ThreadPoolState::global();
-
-                        if let Some(parent) = &join_point.0.parent {
-                            parent.0.children.write().push(join_point.clone());
-                            (*join_point.0.on_change).notify();
-                        }
-                        else {
-                            pool_state.roots.write().push(join_point.clone());
-                        }
-
-                        pool_state.on_change.notify();
-                        
-                        Self::set_current(Some(join_point.clone()));
-
-                        join_point.invoke_work_unit(0);
-                        join_point.join();
-
-                        Self::set_current(join_point.0.parent.clone());
-                    });                    
+        JoinPoint::invoke(
+            todo!(),
+            |i| match i {
+                0 => {
+                    (*result_a.get()).write(oper_a_holder.assume_init_read()());
                 }
-            }
+                1 => {
+                    (*result_b.get()).write(oper_b_holder.assume_init_read()());
+                }
+                _ => unreachable_unchecked(),
+            },
+            2,
+        );
+
+        (
+            result_a.into_inner().assume_init(),
+            result_b.into_inner().assume_init(),
+        )
+    }
+}
+
+/*
+/// Spawns an asynchronous task on the global thread pool.
+/// The returned handle can be used to obtain the result.
+pub fn spawn<T>(f: impl 'static + Send + FnOnce() -> T) -> Task<T> {
+    todo!()
+}
+
+/// A handle to a queued group of work units, which output a single result.
+pub struct Task<T>(Arc<TaskInnerImpl<T>>);
+
+impl<T> Task<T> {
+    /// Cancels this task, preventing it from running if it was not yet started.
+    pub fn cancel(self) {
+        todo!()
+    }
+
+    /// Whether the task has been completed yet.
+    pub fn complete(&self) -> bool {
+        todo!()
+    }
+
+    /// Attempts to get the result of this task if it has been completed. Otherwise, returns
+    /// the original task.
+    pub fn result(self) -> Result<T, Self> {
+        if self.complete() {
+            Ok(self.join())
+        } else {
+            Err(self)
         }
     }
 
-    /// Gets the join point associated with the current context, if any.
-    pub fn current() -> Option<JoinPoint> {
-        unsafe { CURRENT_JOIN_POINT.with(|x| (*x.get()).clone()) }
+    /// Joins the current thread with this task, completing all remaining work.
+    /// After all work is complete, yields the result.
+    pub fn join(self) -> T {
+        let join_point: &JoinPoint = todo!();
+        join_point.join();
+
+        unsafe { (*self.0.result.get()).take().unwrap_unchecked() }
     }
 
-    /// Sets the join point associated with the current context, if any.
-    pub fn set_current(point: Option<JoinPoint>) {
-        unsafe { CURRENT_JOIN_POINT.with(|x| *x.get() = point) }
+    /// Joins with the remaining work on this task, completing all units while they are
+    /// available. Returns immediately if there are outstanding units in progress on other threads.
+    pub fn join_work(&self) {
+        let join_point: &JoinPoint = todo!();
+        join_point.join_work();
+    }
+}
+
+/*
+impl<T> Future for Task<T> {
+    type Output = T;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        /*unsafe {
+            if self.complete() {
+                Poll::Ready(self.get_result())
+            } else {
+                self.control.set_result_waker(cx.waker().clone());
+                Poll::Pending
+            }
+        }*/
+        todo!("Poll work and stih?")
+    }
+} */
+
+trait TaskInner {
+    fn set_join_point(&self, point: Option<JoinPoint>);
+
+    unsafe fn invoke_work_unit(&self, i: usize);
+
+    fn work_units(&self) -> usize;
+}
+
+struct TaskInnerImpl<T> {
+    //root: spin::RwLock<JoinPoint>,
+    /// The result of the task, if it is available.
+    result: UnsafeCell<Option<T>>
+}
+
+/*
+/// A structure which interally alerts a condvar upon wake.
+#[derive(Clone, Default)]
+struct CondvarWaker {
+    /// The inner backing for the waker.
+    inner: Arc<CondvarWakerInner>,
+}
+
+impl CondvarWaker {
+    /// Converts this to a waker.
+    pub fn as_waker(&self) -> Waker {
+        unsafe {
+            Waker::from_raw(Self::clone_waker(
+                &self.inner as *const Arc<CondvarWakerInner> as *const (),
+            ))
+        }
     }
 
-    /// Processes work unit `i`, and wakes up any waiting threads if work is complete.
-    /// 
+    /// Clones the waker.
+    ///
     /// # Safety
-    /// 
-    /// This function may be called exactly once for each `i` on the range `0..self.0.total_invocations`.
-    /// Any other calls are undefined behavior.
-    unsafe fn invoke_work_unit(&self, i: u64) {
-        let _guard = PanicGuard("Panic was not caught at join point boundary; aborting.");
-        
-        debug_assert!(i < self.0.total_invocations, "Invoked out-of-bounds work unit");
-        
-        (*self.0.func)(i as usize);
-        let now_finished = self.0.completed_invocations.fetch_add(1, Ordering::Release) + 1;
+    ///
+    /// For this function to be sound, inner must be a valid pointer to an `Arc<CondvarWakerInner>`.
+    unsafe fn clone_waker(inner: *const ()) -> RawWaker {
+        unsafe {
+            let value = &*(inner as *const Arc<CondvarWakerInner>);
+            let data = Box::into_raw(Box::new(value.clone()));
 
-        if now_finished == self.0.total_invocations {
-            if let Some(parent) = &self.0.parent {
-                let mut siblings = parent.0.children.write();
-                let index = index_of(self, &siblings).unwrap_unchecked();
-                siblings.swap_remove(index);
-            }
-            else {
-                let mut roots = ThreadPoolState::global().roots.write();
-                let index = index_of(self, &roots).unwrap_unchecked();
-                roots.swap_remove(index);
-            }
-
-            (*self.0.on_change).notify();
+            RawWaker::new(
+                data as *const (),
+                &RawWakerVTable::new(
+                    Self::clone_waker,
+                    Self::wake_waker,
+                    Self::wake_by_ref_waker,
+                    Self::drop_waker,
+                ),
+            )
         }
     }
 
-    /// Exhausts all work for this join point (but not any of its children).
-    /// Finishes once all available work has been **started**, but not necessarily finished.
-    /// Returns `true` if at least one available work unit was run to completion.
-    fn invoke_immediate_work(&self) -> bool {
-        let mut ran_item = false;
-        loop {
-            let next_index = self.0.started_invocations.fetch_add(1, Ordering::Relaxed);
-            if next_index < self.0.total_invocations {
-                unsafe { self.invoke_work_unit(next_index); }
-                ran_item = true;
-            }
-            else {
-                return ran_item;
-            }
-        }
+    /// Wakes the waker, and consumes the pointer.
+    ///
+    /// # Safety
+    ///
+    /// For this function to be sound, inner must be a valid owned pointer to an `Arc<CondvarWakerInner>`.
+    unsafe fn wake_waker(inner: *const ()) {
+        Self::wake_by_ref_waker(inner);
+        Self::drop_waker(inner);
     }
 
-    /// Attempts to steal work units from children.
-    /// Finishes once all available work has been **started**, but not necessarily finished.
-    /// Returns `true` if at least one available work unit was run to completion.
-    fn invoke_child_work(&self) -> bool {
-        if let Some((child, i)) = self.select_child_work_unit() {
-            unsafe { Self::invoke_work_unit(&child, i); }
-            Self::join_work(&child);
-            true
-        }
-        else {
-            false
-        }
+    /// Wakes the waker.
+    ///
+    /// # Safety
+    ///
+    /// For this function to be sound, inner must be a valid pointer to an `Arc<CondvarWakerInner>`.
+    #[allow(unused_variables)]
+    unsafe fn wake_by_ref_waker(inner: *const ()) {
+        let inner = &*(inner as *const Arc<CondvarWakerInner>);
+        let guard = inner.lock.lock().expect("Could not lock mutex");
+        inner.on_wake.notify_all();
     }
 
-    /// Steals a work unit from a child. The unit is marked as taken, so it is the caller's
-    /// responsibility to invoke [`Self::invoke_work_unit`] on the child.
-    /// 
-    /// Returns a reference to the child and the index of the work unit.
-    fn select_child_work_unit(&self) -> Option<(JoinPoint, u64)> {
-        Self::select_work_unit_from(&self.0.children.read())
-    }
-
-    /// Attempts to steal work units from this join point.
-    /// Finishes once all available work has been **started**, but not necessarily finished.
-    /// Returns `true` if at least one available work unit was run to completion.
-    fn join_work(&self) -> bool {
-        let invoked_immediate = self.invoke_immediate_work();
-        let invoked_children = self.invoke_child_work();
-        invoked_immediate || invoked_children
-    }
-
-    /// Fetches work from this join point and its children.
-    /// Returns only when all work is complete for the join point.
-    fn join(&self) {
-        self.invoke_immediate_work();
-
-        let mut spin_before_sleep = false;
-
-        while self.0.completed_invocations.load(Ordering::Acquire) < self.0.total_invocations {
-            let listener = unsafe { (*self.0.on_change).listen() }; // todo: no more raw ptr
-            if self.invoke_child_work() {
-                spin_before_sleep = true;
-            }
-            else {
-                // Only spin if something was found to do since the last sleep
-                let spin_cycles = if spin_before_sleep { todo!() } else { 0 };
-                spin_before_sleep = !listener.spin_wait(spin_cycles);
-            }
-        }
-    }
-
-    /// Steals a work unit from one of the join points in the list.
-    /// The unit is marked as taken, so it is the caller's
-    /// responsibility to invoke [`Self::invoke_work_unit`] on the point.
-    /// 
-    /// Returns a reference to the point and the index of the work unit.
-    fn select_work_unit_from(items: &[JoinPoint]) -> Option<(JoinPoint, u64)> {
-        for child in items {
-            let next_index = child.0.started_invocations.fetch_add(1, Ordering::Relaxed);
-            if next_index < child.0.total_invocations {
-                return Some((child.clone(), next_index));
-            }
-            else if let Some(result) = Self::select_child_work_unit(child) {
-                return Some(result);
-            }
-        }
-        None
+    /// Drops the waker, consuming the given pointer.
+    ///
+    /// # Safety
+    ///
+    /// For this function to be sound, inner must be a valid owned pointer to an `Arc<CondvarWakerInner>`.
+    unsafe fn drop_waker(inner: *const ()) {
+        drop(Box::from_raw(inner as *mut Arc<CondvarWakerInner>));
     }
 }
 
-impl PartialEq for JoinPoint {
-    fn eq(&self, other: &Self) -> bool {
-        ScopedRef::ptr_eq(&self.0, &other.0)
+impl Deref for CondvarWaker {
+    type Target = CondvarWakerInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
-/// Holds the inner state for a [`JoinPoint`].
-struct JoinPointInner {
-    /// Places where control has split during parallel execution of this [`JoinPoint`].
-    children: spin::RwLock<SmallVec<[JoinPoint; JoinPoint::CHILD_LIST_CAPACITY]>>,
-    /// The number of invocations that have finished.
-    completed_invocations: AtomicU64,
-    /// The function to invoke.
-    func: *const (dyn 'static + Fn(usize)),
-    /// An event that is signaled when work is available or completed.
-    on_change: *const Event,
-    /// The point that spawned this one.
-    parent: Option<JoinPoint>,
-    /// The number of invocations that have started.
-    started_invocations: AtomicU64,
-    /// The total number of invocations to perform.
-    total_invocations: u64
-}
+/// Stores the inner state for a condition variable waker.
+#[derive(Default)]
+struct CondvarWakerInner {
+    /// The lock that should be used for waiting.
+    lock: sync_impl::Mutex<()>,
+    /// The condition variable that is alerted on wake.
+    on_wake: sync_impl::Condvar,
+} */ */
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+    use paralight::iter::*;
+
+    /// Tests that a parallel iterator can add things.
     #[test]
-    fn test_it() {
-        init(ThreadPoolBuilder::default().num_threads(1));
+    fn test_add() {
+        let thread_pool = ThreadPoolBuilder::default()
+            .build();
 
-        use paralight::iter::*;
-        /*fork(|| {
-            std::thread::sleep_ms(10);
-            println!("A on {:?}", std::thread::current().id());
-        }, || {
-            println!("B on {:?}", std::thread::current().id());
-            std::thread::sleep_ms(120);
-            fork(|| {
-                std::thread::sleep_ms(250);
-                println!("C on {:?}", std::thread::current().id());
-            }, || {
-                println!("D on {:?}", std::thread::current().id());
-            });
-        });*///
-        let mut output = 0..1000;
-        let mut indx = [None; 1000];
+        let len = 10_000;
+        let mut output = vec![0; len];
+        let left = (0..len as u64).collect::<Vec<u64>>();
+        let right = (0..len as u64).collect::<Vec<u64>>();
+        let expected_output = (0..len as u64).map(|x| 2 * x).collect::<Vec<u64>>();
 
-        ((0..1000).into_par_iter(), indx.par_iter_mut())
+        let output_slice = output.as_mut_slice();
+        let left_slice = left.as_slice();
+        let right_slice = right.as_slice();
+
+        (
+            std::hint::black_box(output_slice.par_iter_mut()),
+            std::hint::black_box(left_slice).par_iter(),
+            std::hint::black_box(right_slice).par_iter(),
+        )
             .zip_eq()
-            .with_thread_pool(GLOBAL)
-            .for_each(|(i, out)| *out = Some(std::thread::current().id()));
-        println!("GO {indx:?}");
+            .with_thread_pool(thread_pool.split_by_threads())
+            .for_each(|(out, &a, &b)| *out = a + b);
+
+        assert_eq!(output, expected_output);
+    }
+
+    /// Tests that a parallel iterator can sum things.
+    #[test]
+    fn test_sum() {
+        let thread_pool = ThreadPoolBuilder::default()
+            .build();
+
+        let len = 10_000;
+        let input = (0..len as u64).collect::<Vec<u64>>();
+        let input_slice = input.as_slice();
+        let result = input_slice
+            .par_iter()
+            .with_thread_pool(thread_pool.split_by_threads())
+            .sum::<u64>();
+        assert_eq!(result, 49995000);
     }
 
     /*use futures_executor::*;
