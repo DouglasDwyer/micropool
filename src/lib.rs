@@ -1,22 +1,12 @@
-#![warn(missing_docs)]
-#![allow(warnings)]
+//! todo
 
+#![warn(missing_docs)]
 #![cfg_attr(nightly, feature(thread_local))]
 
-use std::cell::UnsafeCell;
-use std::hint::unreachable_unchecked;
-use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread::{self, available_parallelism, JoinHandle};
-
-use paralight::iter::GenericThreadPool;
 pub use paralight::iter;
-use smallvec::SmallVec;
+use paralight::iter::GenericThreadPool;
 
-use self::join_point::*;
 pub use self::thread_pool::*;
-use self::util::*;
 
 /// Internal tracking for work trees executing on a thread pool.
 mod join_point;
@@ -29,10 +19,11 @@ mod util;
 
 /// Execute [`paralight`] iterators with maximal parallelism.
 /// Every iterator item may be processed on a separate thread.
-/// 
+///
 /// Note: by maximizing parallelism, this also maximizes overhead.
-/// This is best used with computationally-heavy iterators that have few elements.
-/// For alternatives, see [`split_per`], [`split_by`], and [`split_by_threads`].
+/// This is best used with computationally-heavy iterators that have few
+/// elements. For alternatives, see [`split_per`], [`split_by`], and
+/// [`split_by_threads`].
 pub fn split_per_item() -> impl GenericThreadPool {
     struct SplitPerItem;
 
@@ -46,9 +37,18 @@ pub fn split_per_item() -> impl GenericThreadPool {
             reduce: impl Fn(Output, Output) -> Output,
             cleanup: &(impl paralight::iter::SourceCleanup + Sync),
         ) -> Output {
-            ThreadPool::with_current(|f| f.split_per_item().upper_bounded_pipeline(input_len, init, process_item, finalize, reduce, cleanup))
+            ThreadPool::with_current(|f| {
+                f.split_per_item().upper_bounded_pipeline(
+                    input_len,
+                    init,
+                    process_item,
+                    finalize,
+                    reduce,
+                    cleanup,
+                )
+            })
         }
-    
+
         fn iter_pipeline<Output: Send>(
             self,
             input_len: usize,
@@ -56,7 +56,10 @@ pub fn split_per_item() -> impl GenericThreadPool {
             reduce: impl paralight::iter::Accumulator<Output, Output>,
             cleanup: &(impl paralight::iter::SourceCleanup + Sync),
         ) -> Output {
-            ThreadPool::with_current(|f| f.split_per_item().iter_pipeline(input_len, accum, reduce, cleanup))
+            ThreadPool::with_current(|f| {
+                f.split_per_item()
+                    .iter_pipeline(input_len, accum, reduce, cleanup)
+            })
         }
     }
 
@@ -78,9 +81,18 @@ pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
             reduce: impl Fn(Output, Output) -> Output,
             cleanup: &(impl paralight::iter::SourceCleanup + Sync),
         ) -> Output {
-            ThreadPool::with_current(|f| f.split_by(self.0).upper_bounded_pipeline(input_len, init, process_item, finalize, reduce, cleanup))
+            ThreadPool::with_current(|f| {
+                f.split_by(self.0).upper_bounded_pipeline(
+                    input_len,
+                    init,
+                    process_item,
+                    finalize,
+                    reduce,
+                    cleanup,
+                )
+            })
         }
-    
+
         fn iter_pipeline<Output: Send>(
             self,
             input_len: usize,
@@ -88,7 +100,10 @@ pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
             reduce: impl paralight::iter::Accumulator<Output, Output>,
             cleanup: &(impl paralight::iter::SourceCleanup + Sync),
         ) -> Output {
-            ThreadPool::with_current(|f| f.split_by(self.0).iter_pipeline(input_len, accum, reduce, cleanup))
+            ThreadPool::with_current(|f| {
+                f.split_by(self.0)
+                    .iter_pipeline(input_len, accum, reduce, cleanup)
+            })
         }
     }
 
@@ -111,9 +126,18 @@ pub fn split_by(chunks: usize) -> impl GenericThreadPool {
             reduce: impl Fn(Output, Output) -> Output,
             cleanup: &(impl paralight::iter::SourceCleanup + Sync),
         ) -> Output {
-            ThreadPool::with_current(|f| f.split_by(self.0).upper_bounded_pipeline(input_len, init, process_item, finalize, reduce, cleanup))
+            ThreadPool::with_current(|f| {
+                f.split_by(self.0).upper_bounded_pipeline(
+                    input_len,
+                    init,
+                    process_item,
+                    finalize,
+                    reduce,
+                    cleanup,
+                )
+            })
         }
-    
+
         fn iter_pipeline<Output: Send>(
             self,
             input_len: usize,
@@ -121,7 +145,10 @@ pub fn split_by(chunks: usize) -> impl GenericThreadPool {
             reduce: impl paralight::iter::Accumulator<Output, Output>,
             cleanup: &(impl paralight::iter::SourceCleanup + Sync),
         ) -> Output {
-            ThreadPool::with_current(|f| f.split_by(self.0).iter_pipeline(input_len, accum, reduce, cleanup))
+            ThreadPool::with_current(|f| {
+                f.split_by(self.0)
+                    .iter_pipeline(input_len, accum, reduce, cleanup)
+            })
         }
     }
 
@@ -130,7 +157,8 @@ pub fn split_by(chunks: usize) -> impl GenericThreadPool {
 
 /// Execute [`paralight`] iterators by batching elements.
 /// Every iterator will be broken up into `N` separate work units,
-/// where `N` is the number of pool threads. Each unit may be processed in parallel.
+/// where `N` is the number of pool threads. Each unit may be processed in
+/// parallel.
 pub fn split_by_threads() -> impl GenericThreadPool {
     struct SplitByThreads;
 
@@ -144,9 +172,18 @@ pub fn split_by_threads() -> impl GenericThreadPool {
             reduce: impl Fn(Output, Output) -> Output,
             cleanup: &(impl paralight::iter::SourceCleanup + Sync),
         ) -> Output {
-            ThreadPool::with_current(|f| f.split_by_threads().upper_bounded_pipeline(input_len, init, process_item, finalize, reduce, cleanup))
+            ThreadPool::with_current(|f| {
+                f.split_by_threads().upper_bounded_pipeline(
+                    input_len,
+                    init,
+                    process_item,
+                    finalize,
+                    reduce,
+                    cleanup,
+                )
+            })
         }
-    
+
         fn iter_pipeline<Output: Send>(
             self,
             input_len: usize,
@@ -154,7 +191,10 @@ pub fn split_by_threads() -> impl GenericThreadPool {
             reduce: impl paralight::iter::Accumulator<Output, Output>,
             cleanup: &(impl paralight::iter::SourceCleanup + Sync),
         ) -> Output {
-            ThreadPool::with_current(|f| f.split_by_threads().iter_pipeline(input_len, accum, reduce, cleanup))
+            ThreadPool::with_current(|f| {
+                f.split_by_threads()
+                    .iter_pipeline(input_len, accum, reduce, cleanup)
+            })
         }
     }
 
@@ -382,6 +422,27 @@ mod tests {
             .with_thread_pool(crate::split_by_threads())
             .sum::<u64>();
         assert_eq!(result, 49995000);
+    }
+
+    #[test]
+    fn test_it2() {
+        use crate as micropool;
+
+        println!("A {:?}", std::thread::current().id());
+        //let background_task = micropool::spawn(|| println!("B {:?}", std::thread::current().id()));
+
+        micropool::join(|| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            println!("C {:?}", std::thread::current().id())
+        }, || {
+            println!("D {:?}", std::thread::current().id());
+            micropool::join(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                println!("E {:?}", std::thread::current().id())
+            }, || {
+                println!("F {:?}", std::thread::current().id());
+            });
+        });
     }
 
     /*use futures_executor::*;

@@ -2,9 +2,8 @@ use std::cell::UnsafeCell;
 use std::hint::unreachable_unchecked;
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread::{self, available_parallelism, JoinHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle, available_parallelism};
 
 use paralight::iter::GenericThreadPool;
 use smallvec::SmallVec;
@@ -28,7 +27,8 @@ thread_local! {
 
 /// Determines how a thread pool will behave.
 pub struct ThreadPoolBuilder {
-    /// Threads waiting for work will spin at least this many cycles before sleeping.
+    /// Threads waiting for work will spin at least this many cycles before
+    /// sleeping.
     idle_spin_cycles: usize,
     /// The number of threads to spawn.
     num_threads: usize,
@@ -46,7 +46,7 @@ impl ThreadPoolBuilder {
     /// **optional**.  If you do not call this function, the thread pool
     /// will be automatically initialized with the default
     /// configuration.
-    /// 
+    ///
     /// Panics if the global thread pool was already initialized.
     pub fn build_global(self) {
         let mut run = false;
@@ -60,7 +60,8 @@ impl ThreadPoolBuilder {
         }
     }
 
-    /// Threads waiting for work will spin at least this many cycles before sleeping.
+    /// Threads waiting for work will spin at least this many cycles before
+    /// sleeping.
     pub fn idle_spin_cycles(self, idle_spin_cycles: usize) -> Self {
         Self {
             idle_spin_cycles,
@@ -92,8 +93,11 @@ impl Default for ThreadPoolBuilder {
     fn default() -> Self {
         Self {
             idle_spin_cycles: 150000,
-            num_threads: available_parallelism().map(usize::from).unwrap_or_default()
-                .saturating_sub(1).max(1),
+            num_threads: available_parallelism()
+                .map(usize::from)
+                .unwrap_or_default()
+                .saturating_sub(1)
+                .max(1),
             spawn_handler: Box::new(|_, x| thread::spawn(x)),
         }
     }
@@ -110,7 +114,7 @@ pub struct ThreadPool {
     /// Handles for stopping the pool threads.
     join_handles: Vec<JoinHandle<()>>,
     /// The shared state for the threadpool.
-    state: &'static ThreadPoolState
+    state: &'static ThreadPoolState,
 }
 
 impl ThreadPool {
@@ -129,20 +133,26 @@ impl ThreadPool {
 
         Self {
             join_handles,
-            state
+            state,
         }
     }
 
-    /// Changes the current context to this thread pool. Any attempts to use [`crate::join`]
-    /// or parallel iterators will operate within this pool.
-    /// 
-    /// Panics if called from within a parallel iterator or other asynchronous task.
+    /// Changes the current context to this thread pool. Any attempts to use
+    /// [`crate::join`] or parallel iterators will operate within this pool.
+    ///
+    /// Panics if called from within a parallel iterator or other asynchronous
+    /// task.
     pub fn install<R>(&self, f: impl FnOnce() -> R) -> R {
         unsafe {
-            assert!(JoinPoint::current().is_none(), "Attempted to enter pool from within another context.");
+            assert!(
+                JoinPoint::current().is_none(),
+                "Attempted to enter pool from within another context."
+            );
 
-            #[cfg(nightly)] {
-                let _guard = PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
+            #[cfg(nightly)]
+            {
+                let _guard =
+                    PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
                 let previous = *LOCAL_POOL.get();
                 *LOCAL_POOL.get() = self;
                 let result = f();
@@ -152,7 +162,8 @@ impl ThreadPool {
 
             #[cfg(not(nightly))]
             LOCAL_POOL.with(|x| {
-                let _guard = PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
+                let _guard =
+                    PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
                 let previous = *x.get();
                 *x.get() = self;
                 let result = f();
@@ -161,14 +172,15 @@ impl ThreadPool {
             })
         }
     }
-    
+
     /// Executes `f` within the context of the current thread pool.
     /// Initializes the global thread pool if no other pool is active.
     pub(crate) fn with_current<R>(f: impl FnOnce(&ThreadPool) -> R) -> R {
         unsafe {
-            #[cfg(nightly)] {
+            #[cfg(nightly)]
+            {
                 let value = &mut *LOCAL_POOL.get();
-                
+
                 if value.is_null() {
                     *value = GLOBAL_POOL.call_once(|| ThreadPoolBuilder::default().build());
                 }
@@ -180,7 +192,7 @@ impl ThreadPool {
             #[cfg(not(nightly))]
             LOCAL_POOL.with(|x| {
                 let value = &mut *x.get();
-                
+
                 if value.is_null() {
                     *value = GLOBAL_POOL.call_once(|| ThreadPoolBuilder::default().build());
                 }
@@ -235,10 +247,11 @@ impl ThreadPool {
 
     /// Execute [`paralight`] iterators with maximal parallelism.
     /// Every iterator item may be processed on a separate thread.
-    /// 
+    ///
     /// Note: by maximizing parallelism, this also maximizes overhead.
-    /// This is best used with computationally-heavy iterators that have few elements.
-    /// For alternatives, see [`Self::split_per`], [`Self::split_by`], and [`Self::split_by_threads`].
+    /// This is best used with computationally-heavy iterators that have few
+    /// elements. For alternatives, see [`Self::split_per`],
+    /// [`Self::split_by`], and [`Self::split_by_threads`].
     pub fn split_per_item(&self) -> impl '_ + GenericThreadPool {
         ThreadPerItem(self)
     }
@@ -286,14 +299,14 @@ struct ThreadPerItem<'a>(&'a ThreadPool);
 
 impl<'a> GenericThreadPool for ThreadPerItem<'a> {
     fn upper_bounded_pipeline<Output: Send, Accum>(
-            self,
-            input_len: usize,
-            init: impl Fn() -> Accum + Sync,
-            process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
-            finalize: impl Fn(Accum) -> Output + Sync,
-            reduce: impl Fn(Output, Output) -> Output,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
-        ) -> Output {
+        self,
+        input_len: usize,
+        init: impl Fn() -> Accum + Sync,
+        process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+        finalize: impl Fn(Accum) -> Output + Sync,
+        reduce: impl Fn(Output, Output) -> Output,
+        _: &(impl paralight::iter::SourceCleanup + Sync),
+    ) -> Output {
         unsafe {
             let mut output = SmallVec::<[Output; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
             output.reserve_exact(input_len);
@@ -302,25 +315,30 @@ impl<'a> GenericThreadPool for ThreadPerItem<'a> {
             JoinPoint::invoke(
                 self.0.state,
                 |i| {
-                    output_buffer.add(i).write(finalize(match process_item(init(), i) {
-                        ControlFlow::Break(x) | ControlFlow::Continue(x) => x
-                    }));
+                    output_buffer
+                        .add(i)
+                        .write(finalize(match process_item(init(), i) {
+                            ControlFlow::Break(x) | ControlFlow::Continue(x) => x,
+                        }));
                 },
                 input_len,
             );
 
             output.set_len(input_len);
-            output.into_iter().reduce(reduce).expect("Iterator was empty")
+            output
+                .into_iter()
+                .reduce(reduce)
+                .expect("Iterator was empty")
         }
     }
 
     fn iter_pipeline<Output: Send>(
-            self,
-            input_len: usize,
-            accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
-            reduce: impl paralight::iter::Accumulator<Output, Output>,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
-        ) -> Output {
+        self,
+        input_len: usize,
+        accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
+        reduce: impl paralight::iter::Accumulator<Output, Output>,
+        _: &(impl paralight::iter::SourceCleanup + Sync),
+    ) -> Output {
         unsafe {
             let mut output = SmallVec::<[Output; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
             output.reserve_exact(input_len);
@@ -340,7 +358,8 @@ impl<'a> GenericThreadPool for ThreadPerItem<'a> {
     }
 }
 
-/// Implementation for [`ThreadPool::split_per`], [`ThreadPool::split_by`], and [`ThreadPool::split_by_threads`].
+/// Implementation for [`ThreadPool::split_per`], [`ThreadPool::split_by`], and
+/// [`ThreadPool::split_by_threads`].
 struct ThreadPerChunk<'a, F: Fn(usize) -> (usize, usize)> {
     /// Maps the input iterator size to a chunk size and work unit count.
     chunk_units_calculator: F,
@@ -350,14 +369,14 @@ struct ThreadPerChunk<'a, F: Fn(usize) -> (usize, usize)> {
 
 impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for ThreadPerChunk<'a, F> {
     fn upper_bounded_pipeline<Output: Send, Accum>(
-            self,
-            input_len: usize,
-            init: impl Fn() -> Accum + Sync,
-            process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
-            finalize: impl Fn(Accum) -> Output + Sync,
-            reduce: impl Fn(Output, Output) -> Output,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
-        ) -> Output {
+        self,
+        input_len: usize,
+        init: impl Fn() -> Accum + Sync,
+        process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+        finalize: impl Fn(Accum) -> Output + Sync,
+        reduce: impl Fn(Output, Output) -> Output,
+        _: &(impl paralight::iter::SourceCleanup + Sync),
+    ) -> Output {
         unsafe {
             let (chunk_size, work_units) = (self.chunk_units_calculator)(input_len);
 
@@ -376,7 +395,7 @@ impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for ThreadPerChunk<'a
 
                     for j in start..end {
                         accumulator = match process_item(accumulator, j) {
-                            ControlFlow::Break(x) | ControlFlow::Continue(x) => x
+                            ControlFlow::Break(x) | ControlFlow::Continue(x) => x,
                         };
                     }
 
@@ -386,20 +405,23 @@ impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for ThreadPerChunk<'a
             );
 
             output.set_len(work_units);
-            output.into_iter().reduce(reduce).expect("Iterator was empty")
+            output
+                .into_iter()
+                .reduce(reduce)
+                .expect("Iterator was empty")
         }
     }
 
     fn iter_pipeline<Output: Send>(
-            self,
-            input_len: usize,
-            accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
-            reduce: impl paralight::iter::Accumulator<Output, Output>,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
-        ) -> Output {
+        self,
+        input_len: usize,
+        accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
+        reduce: impl paralight::iter::Accumulator<Output, Output>,
+        _: &(impl paralight::iter::SourceCleanup + Sync),
+    ) -> Output {
         unsafe {
             let (chunk_size, work_units) = (self.chunk_units_calculator)(input_len);
-            
+
             let mut output = SmallVec::<[Output; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
             output.reserve_exact(work_units);
             let output_buffer = output.as_mut_ptr();
@@ -420,10 +442,12 @@ impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for ThreadPerChunk<'a
     }
 }
 
-/// Stores the inner state for a [`ThreadPool`] and coordinates work across multiple threads.
+/// Stores the inner state for a [`ThreadPool`] and coordinates work across
+/// multiple threads.
 #[derive(Default)]
 pub(crate) struct ThreadPoolState {
-    /// Threads waiting for work will spin for at least this many cycles before sleeping.
+    /// Threads waiting for work will spin for at least this many cycles before
+    /// sleeping.
     pub idle_spin_cycles: usize,
     /// An event that is invoked whenever new work is available.
     pub on_change: Event,
@@ -441,7 +465,7 @@ impl ThreadPoolState {
             idle_spin_cycles: builder.idle_spin_cycles,
             on_change: Event::new(),
             roots: spin::RwLock::new(Vec::new()),
-            should_stop: AtomicBool::new(false)
+            should_stop: AtomicBool::new(false),
         }
     }
 
@@ -467,12 +491,15 @@ impl ThreadPoolState {
                 }
                 point.join_work();
                 JoinPoint::set_current(None);
-            }
-            else if self.should_stop.load(Ordering::Acquire) {
+            } else if self.should_stop.load(Ordering::Acquire) {
                 return;
             } else {
                 // Only spin if something was found to do since the last sleep
-                let spin_cycles = if spin_before_sleep { self.idle_spin_cycles } else { 0 };
+                let spin_cycles = if spin_before_sleep {
+                    self.idle_spin_cycles
+                } else {
+                    0
+                };
                 spin_before_sleep = !listener.spin_wait(spin_cycles);
             }
         }

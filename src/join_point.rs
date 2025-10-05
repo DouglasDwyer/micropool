@@ -1,11 +1,6 @@
 use std::cell::UnsafeCell;
-use std::hint::unreachable_unchecked;
-use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread::{self, available_parallelism, JoinHandle};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use paralight::iter::GenericThreadPool;
 use smallvec::SmallVec;
 
 use crate::thread_pool::ThreadPoolState;
@@ -47,8 +42,13 @@ impl JoinPoint {
                     let maybe_on_change = Event::new();
                     let parent = Self::current();
 
-                    if parent.as_ref().is_some_and(|x| !std::ptr::eq(x.0.pool, pool)) {
-                        panic!("Attempted to parallelize work with two different thread pools simultaneously");
+                    if parent
+                        .as_ref()
+                        .is_some_and(|x| !std::ptr::eq(x.0.pool, pool))
+                    {
+                        panic!(
+                            "Attempted to parallelize work with two different thread pools simultaneously"
+                        );
                     }
 
                     ScopedRef::of(
@@ -93,17 +93,25 @@ impl JoinPoint {
     /// Gets the join point associated with the current context, if any.
     pub fn current() -> Option<JoinPoint> {
         #[cfg(nightly)]
-        unsafe { (*CURRENT_JOIN_POINT.get()).clone() }
+        unsafe {
+            (*CURRENT_JOIN_POINT.get()).clone()
+        }
         #[cfg(not(nightly))]
-        unsafe { CURRENT_JOIN_POINT.with(|x| (*x.get()).clone()) }
+        unsafe {
+            CURRENT_JOIN_POINT.with(|x| (*x.get()).clone())
+        }
     }
 
     /// Sets the join point associated with the current context, if any.
     pub fn set_current(point: Option<JoinPoint>) {
         #[cfg(nightly)]
-        unsafe { *CURRENT_JOIN_POINT.get() = point }
+        unsafe {
+            *CURRENT_JOIN_POINT.get() = point
+        }
         #[cfg(not(nightly))]
-        unsafe { CURRENT_JOIN_POINT.with(|x| *x.get() = point) }
+        unsafe {
+            CURRENT_JOIN_POINT.with(|x| *x.get() = point)
+        }
     }
 
     /// Processes work unit `i`, and wakes up any waiting threads if work is
@@ -209,11 +217,14 @@ impl JoinPoint {
                     spin_before_sleep = true;
                 } else {
                     // Only spin if something was found to do since the last sleep
-                    let spin_cycles = if spin_before_sleep { self.0.pool.idle_spin_cycles } else { 0 };
+                    let spin_cycles = if spin_before_sleep {
+                        self.0.pool.idle_spin_cycles
+                    } else {
+                        0
+                    };
                     spin_before_sleep = !listener.spin_wait(spin_cycles);
                 }
-            }
-            else {
+            } else {
                 break;
             }
         }

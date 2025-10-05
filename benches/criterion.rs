@@ -6,7 +6,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::mem::size_of;
 
 const NUM_THREADS: &[usize] = &[1, 2, 4, 8];
@@ -48,55 +48,47 @@ mod micropool {
     use paralight::iter::*;
     use std::hint::black_box;
 
-    pub fn sum(
-        bencher: &mut Bencher,
-        num_threads: usize,
-        len: &usize,
-    ) {
+    pub fn sum(bencher: &mut Bencher, num_threads: usize, len: &usize) {
         micropool::ThreadPoolBuilder::default()
             .num_threads(num_threads - 1)
             .build()
             .install(|| {
-            let input = (0..*len as u64).collect::<Vec<u64>>();
-            let input_slice = input.as_slice();
-            
-            bencher.iter(|| {
-                black_box(input_slice)
-                    .par_iter()
-                    .with_thread_pool(micropool::split_by_threads())
-                    .sum::<u64>()
+                let input = (0..*len as u64).collect::<Vec<u64>>();
+                let input_slice = input.as_slice();
+
+                bencher.iter(|| {
+                    black_box(input_slice)
+                        .par_iter()
+                        .with_thread_pool(micropool::split_by_threads())
+                        .sum::<u64>()
+                });
             });
-        });
     }
 
-    pub fn add(
-        bencher: &mut Bencher,
-        num_threads: usize,
-        len: &usize,
-    ) {
+    pub fn add(bencher: &mut Bencher, num_threads: usize, len: &usize) {
         micropool::ThreadPoolBuilder::default()
             .num_threads(num_threads - 1)
             .build()
             .install(|| {
-            let mut output = vec![0; *len];
-            let left = (0..*len as u64).collect::<Vec<u64>>();
-            let right = (0..*len as u64).collect::<Vec<u64>>();
+                let mut output = vec![0; *len];
+                let left = (0..*len as u64).collect::<Vec<u64>>();
+                let right = (0..*len as u64).collect::<Vec<u64>>();
 
-            let output_slice = output.as_mut_slice();
-            let left_slice = left.as_slice();
-            let right_slice = right.as_slice();
+                let output_slice = output.as_mut_slice();
+                let left_slice = left.as_slice();
+                let right_slice = right.as_slice();
 
-            bencher.iter(|| {
-                (
-                    black_box(output_slice.par_iter_mut()),
-                    black_box(left_slice).par_iter(),
-                    black_box(right_slice).par_iter(),
-                )
-                    .zip_eq()
-                    .with_thread_pool(micropool::split_by_threads())
-                    .for_each(|(out, &a, &b)| *out = a + b)
+                bencher.iter(|| {
+                    (
+                        black_box(output_slice.par_iter_mut()),
+                        black_box(left_slice).par_iter(),
+                        black_box(right_slice).par_iter(),
+                    )
+                        .zip_eq()
+                        .with_thread_pool(micropool::split_by_threads())
+                        .for_each(|(out, &a, &b)| *out = a + b)
+                });
             });
-        });
     }
 }
 
