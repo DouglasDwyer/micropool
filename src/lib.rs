@@ -1,14 +1,19 @@
 #![allow(warnings)]
 #![warn(missing_docs)]
 
-use std::{cell::{Cell, UnsafeCell}, hint::{black_box, spin_loop, unreachable_unchecked}, marker::PhantomData, mem::MaybeUninit, ops::{Deref, Index}, ptr::NonNull, sync::{atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering}, Arc}, thread::{self, available_parallelism}};
+use std::{cell::{Cell, UnsafeCell}, hint::{black_box, spin_loop, unreachable_unchecked}, marker::PhantomData, mem::MaybeUninit, ops::{ControlFlow, Deref, Index}, ptr::NonNull, sync::{atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering}, Arc}, thread::{self, available_parallelism}};
 
 use paralight::iter::{BaseParallelIterator, GenericThreadPool, ParallelIterator, ParallelSource, ParallelSourceExt};
 use smallvec::{smallvec, SmallVec};
 
+use self::util::{Event, EventListener, PanicGuard, ScopedRef, index_of};
+
+/// Synchronization primitives and helper types used in the implementation.
+mod util;
+
 /// A handle to the global threadpool. This can be passed to [`paralight::iter::ParallelSourceExt::with_thread_pool`]
 /// to create parallel iterators.
-pub const POOL: TodoThreadPool = TodoThreadPool;
+pub const GLOBAL: GlobalPool = GlobalPool;
 
 /// Determines how a thread pool will behave.
 pub struct ThreadPoolBuilder {
@@ -66,9 +71,10 @@ impl Default for ThreadPoolBuilder {
     }
 }
 
-struct TodoThreadPool;
+/// todo
+pub struct GlobalPool;
 
-impl GenericThreadPool for TodoThreadPool {
+impl GenericThreadPool for GlobalPool {
     fn upper_bounded_pipeline<Output: Send, Accum>(
         self,
         input_len: usize,
@@ -78,7 +84,39 @@ impl GenericThreadPool for TodoThreadPool {
         reduce: impl Fn(Output, Output) -> Output,
         cleanup: &(impl paralight::iter::SourceCleanup + Sync),
     ) -> Output {
-        todo!()
+        unsafe {
+            /*let items_per_work_unit = 16; // todo
+            let work_units = (input_len + items_per_work_unit - 1) / items_per_work_unit;
+            let bound = AtomicUsize::new(work_units);
+
+            let mut output = SmallVec::<[Output; 16]>::new();  //todo: dynamic size to keep stack const
+            output.reserve_exact(work_units);
+            let output_buffer = output.as_mut_ptr();
+
+            JoinPoint::invoke(|i| {
+                let mut accumulator = init();
+                let start = i * items_per_work_unit;
+                let end = (start + items_per_work_unit).min(bound.load(Or));
+                
+                for k in start..end {
+                    let acc = process_item(accumulator, i);
+                    accumulator = match acc {
+                        ControlFlow::Continue(acc) => acc,
+                        ControlFlow::Break(acc) => {
+                            self.bound.fetch_min(i, Ordering::Relaxed);
+                            acc
+                        }
+                    };
+                }
+
+                output_buffer.add(i).write(process_item(accumulator, i));
+            }, work_units);
+            
+            output.set_len(input_len);
+
+            reduce.accumulate(output.into_iter())*/
+            todo!()
+        }
     }
 
     fn iter_pipeline<Output: Send>(
@@ -121,7 +159,7 @@ pub fn init(builder: ThreadPoolBuilder) {
     });
 
     if !run {
-        panic!("TODO::init called after thread pool was active");
+        panic!("micropool::init called after thread pool was active");
     }
 }
 
@@ -287,9 +325,10 @@ impl JoinPoint {
     /// 
     /// # Safety
     /// 
-    /// todo
+    /// This function may be called exactly once for each `i` on the range `0..self.0.total_invocations`.
+    /// Any other calls are undefined behavior.
     unsafe fn invoke_work_unit(&self, i: u64) {
-        let _guard = PanicGuard;
+        let _guard = PanicGuard("Panic was not caught at join point boundary; aborting.");
         
         debug_assert!(i < self.0.total_invocations, "Invoked out-of-bounds work unit");
         
@@ -423,158 +462,6 @@ struct JoinPointInner {
     total_invocations: u64
 }
 
-/// A synchronization primitive for blocking threads until an event occurs.
-/// The primitive is reusable and will wake up all pending listeners each time
-/// it is signaled.
-#[derive(Debug, Default)]
-pub struct Event {
-    /// The version number - incremented each time the event changes.
-    version: AtomicU64
-}
-
-impl Event {
-    /// Initializes a new event.
-    pub const fn new() -> Self {
-        Self { version: AtomicU64::new(0) }
-    }
-
-    /// Notifies all listeners that this event has changed.
-    pub fn notify(&self) {
-        self.version.fetch_add(1, Ordering::Release);
-        atomic_wait::wake_all(self.atomic_address());
-    }
-
-    /// Begins listening for changes to `self`. The event listener
-    /// will block until [`Self::notify`] is called by another thread.
-    pub fn listen(&self) -> EventListener<'_> {
-        EventListener { event: self, version: self.version.load(Ordering::Acquire) }
-    }
-
-    /// Gets the atomic address on which to wait for events.
-    fn atomic_address(&self) -> &AtomicU32 {
-        unsafe { &*(&self.version as *const _ as *const _) }
-    }
-}
-
-/// Allows for waiting for an [`Event`] to change.
-#[derive(Copy, Clone, Debug)]
-pub struct EventListener<'a> {
-    /// The event in question.
-    event: &'a Event,
-    /// The version number of the event when this listener was created.
-    version: u64
-}
-
-impl<'a> EventListener<'a> {
-    /// Whether [`Event::notify`] has been called at least once after this object's creation.
-    pub fn signaled(&self) -> bool {
-        self.event.version.load(Ordering::Acquire) != self.version
-    }
-
-    /// Blocks the current thread, spinning in a loop for `cycles` before falling back
-    /// to blocking with the operating system scheduler. Returns `true` only if the
-    /// thread was put to sleep by the operating system.
-    pub fn spin_wait(&self, cycles: usize) -> bool {
-        let mut i = 0;
-        while i < cycles {
-            if self.signaled() {
-                return false;
-            }
-
-            black_box(i);
-            spin_loop();
-            i += 1;
-        }
-
-        self.wait();
-        true
-    }
-
-    /// Blocks the current thread. Returns when [`Event::notify`] has been called at least once
-    /// since this object's creation.
-    pub fn wait(&self) {
-        unsafe {
-            while !self.signaled() {
-                atomic_wait::wait(self.event.atomic_address(), self.version as u32);
-            }
-        }
-    }
-}
-
-/// Allows for erasing lifetimes and sharing references on the stack.
-struct ScopedRef<T>(NonNull<ScopedHolder<T>>);
-
-impl<T> ScopedRef<T> {
-    /// Wraps `value` in a [`ScopedRef`], which is provided to `scope`.
-    /// Once `scope` completes, this function will block until all
-    /// clones of the reference are dropped.
-    pub fn of<R>(value: T, scope: impl FnOnce(Self) -> R) -> R {
-        let holder = ScopedHolder { ref_count: AtomicUsize::new(1), value };
-        scope(ScopedRef(NonNull::from_ref(&holder)))
-    }
-
-    /// Determines whether two scoped references refer to the same underlying object.
-    pub fn ptr_eq(lhs: &Self, rhs: &Self) -> bool {
-        lhs.0 == rhs.0
-    }
-}
-
-impl<T> Clone for ScopedRef<T> {
-    fn clone(&self) -> Self {
-        unsafe {
-            self.0.as_ref().ref_count.fetch_add(1, Ordering::Release);
-            Self(self.0)
-        }
-    }
-}
-
-impl<T> Deref for ScopedRef<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &self.0.as_ref().value }
-    }
-}
-
-impl<T> Drop for ScopedRef<T> {
-    fn drop(&mut self) {
-        unsafe { self.0.as_ref().ref_count.fetch_sub(1, Ordering::Release); }
-    }
-}
-
-/// Stores the inner state for a [`ScopedRef`].
-struct ScopedHolder<T> {
-    /// The number of active references to this holder.
-    ref_count: AtomicUsize,
-    /// The underlying value.
-    value: T
-}
-
-impl<T> Drop for ScopedHolder<T> {
-    fn drop(&mut self) {
-        while 0 < self.ref_count.load(Ordering::Acquire) {
-            spin_loop();
-        }
-    }
-}
-
-/// Ensures that the program aborts on unhandled panics across [`JoinPoint`]s.
-struct PanicGuard;
-
-impl Drop for PanicGuard {
-    fn drop(&mut self) {
-        if thread::panicking() {
-            panic!("Panic was not caught at join point boundary; aborting.");
-        }
-    }
-}
-
-/// Gets the first index of `value` within `slice`, or returns [`None`] if
-/// it was not found.
-fn index_of<T: PartialEq>(value: &T, slice: &[T]) -> Option<usize> {
-    slice.iter().position(|x| x == value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,7 +489,7 @@ mod tests {
 
         ((0..1000).into_par_iter(), indx.par_iter_mut())
             .zip_eq()
-            .with_thread_pool(POOL)
+            .with_thread_pool(GLOBAL)
             .for_each(|(i, out)| *out = Some(std::thread::current().id()));
         println!("GO {indx:?}");
     }

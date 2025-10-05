@@ -1,13 +1,16 @@
 [package]
-name = "task_pool"
+name = "micropool"
 version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/DouglasDwyer/task_pool"
+repository = "https://github.com/DouglasDwyer/micropool"
 readme = "README.md"
 description = """
-Flexible abstraction for task-based composable multithreading.
+Low-latency thread pool for paralight
 """
+
+[build-dependencies]
+rustversion = { version = "1.0.14", default-features = false }
 
 [dependencies]
 atomic-wait = { version = "1.1.0", default-features = false }
