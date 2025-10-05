@@ -1,4 +1,4 @@
-//! todo
+#![doc = include_str!("../README.md")]
 
 #![warn(missing_docs)]
 #![cfg_attr(nightly, feature(thread_local))]
@@ -213,16 +213,16 @@ where
     ThreadPool::with_current(|pool| pool.join(oper_a, oper_b))
 }
 
-/*
 /// Spawns an asynchronous task on the global thread pool.
 /// The returned handle can be used to obtain the result.
 pub fn spawn<T>(f: impl 'static + Send + FnOnce() -> T) -> Task<T> {
-    todo!()
+    Task(std::marker::PhantomData)
 }
 
 /// A handle to a queued group of work units, which output a single result.
-pub struct Task<T>(Arc<TaskInnerImpl<T>>);
+pub struct Task<T>(std::marker::PhantomData<T>);
 
+/*
 impl<T> Task<T> {
     /// Cancels this task, preventing it from running if it was not yet started.
     pub fn cancel(self) {
@@ -422,27 +422,6 @@ mod tests {
             .with_thread_pool(crate::split_by_threads())
             .sum::<u64>();
         assert_eq!(result, 49995000);
-    }
-
-    #[test]
-    fn test_it2() {
-        use crate as micropool;
-
-        println!("A {:?}", std::thread::current().id());
-        //let background_task = micropool::spawn(|| println!("B {:?}", std::thread::current().id()));
-
-        micropool::join(|| {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            println!("C {:?}", std::thread::current().id())
-        }, || {
-            println!("D {:?}", std::thread::current().id());
-            micropool::join(|| {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                println!("E {:?}", std::thread::current().id())
-            }, || {
-                println!("F {:?}", std::thread::current().id());
-            });
-        });
     }
 
     /*use futures_executor::*;
