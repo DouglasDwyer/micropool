@@ -11,7 +11,29 @@
 1. **🎚️⚡ Two priority tiers:** foreground work created by a blocking call is always prioritized over background tasks created via `spawn`.
 1. **🔄💤 Spinning before sleeping:** threads will spin for a configurable interval before sleeping with the operating system scheduler.
 
-The following example illustrates these properties:
+### Usage
+
+Parallel iterators allow for splitting common list operations across multiple threads. `micropool` re-exports the [`paralight`](https://github.com/gendx/paralight) library:
+
+```rust
+use micropool::iter::*;
+
+let len = 10_000;
+let input = (0..len as u64).collect::<Vec<u64>>();
+let input_slice = input.as_slice();
+let result = input_slice
+    .par_iter()
+    .with_thread_pool(micropool::split_by_threads())
+    .sum::<u64>();
+
+assert_eq!(result, 49995000);
+```
+
+The `.with_thread_pool` line specifies that the current `micropool` instance should be used, and `split_by_threads` indicates that each pool thread should process an equal-sized chunk of the data. Other data-splitting strategies available are `split_by`, `split_per_item`, and `split_per`.
+
+### Scheduling system
+
+The following example illustrates the properties of the `micropool` scheduling system:
 
 ```rust
 println!("A {:?}", std::thread::current().id());
@@ -49,23 +71,3 @@ There are several key differences between `micropool`'s behavior and `rayon`, fo
 1. When the external thread finishes its work, and is blocking on the result of `join`, there is other work available: the `background_task`. In this case, completion of `background_task` is not required for `join` to return. As such, the external thread will **never** run it. In contrast, if a `rayon` thread is blocked, it may run unrelated work in the meantime, so it may take a long/unpredictable amount of time before control flow returns from the `join`.
 1. Worker threads will always help with synchronous work (like `join`) before processing asynchronous tasks created via `spawn`. This natural separation of foreground and background work ensures that the most important foreground tasks - like per-frame rendering or physics in a agame engine - happen first.
 1.  [According to Dennis Gustafsson, workers that spin while waiting for new tasks sometimes perform better than workers that sleep.](https://www.youtube.com/watch?v=Kvsvd67XUKw) When many short tasks are scheduled, the overhead of operating system calls for sleeping can outweight the wasted compute. `micropool` compensates for this by spinning threads before they sleep.
-
-### Usage
-
-Parallel iterators allow for splitting common list operations across multiple threads. `micropool` re-exports the [`paralight`](https://github.com/gendx/paralight) library:
-
-```rust
-use micropool::iter::*;
-
-let len = 10_000;
-let input = (0..len as u64).collect::<Vec<u64>>();
-let input_slice = input.as_slice();
-let result = input_slice
-    .par_iter()
-    .with_thread_pool(micropool::split_by_threads())
-    .sum::<u64>();
-
-assert_eq!(result, 49995000);
-```
-
-The `.with_thread_pool` line specifies that the current `micropool` instance should be used, and `split_by_threads` indicates that each pool thread should process an equal-sized chunk of the data. Other data-splitting strategies available are `split_by`, `split_per_item`, and `split_per`.
