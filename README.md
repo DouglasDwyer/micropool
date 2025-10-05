@@ -7,7 +7,7 @@
 
 1. **🧵🤝 External threads participate:** when a non-pool thread is blocked on `micropool` (from calling `join` or using a parallel iterator), it will actively help complete the work. This eliminates the overhead of a context switch.
 1. **⏩✅ Forward progress is guaranteed:** any synchronous work that uses `micropool` is guaranteed to have at least one thread processing it, from the moment of creation.
-1. **🎯🛡️ Scope-based work stealing:** a thread that is blocked _will only_ steal work related to its current task. Blocked threads _will never_ work-steal unrelated tasks, which might take an unpredictable amount of time to finish.
+1. **🎯🛡️ Scope-based work stealing:** a thread that is blocked _will only_ steal work related to its current task. Blocked threads _will never_ steal unrelated work, which might take an unpredictable amount of time to finish.
 1. **🎚️⚡ Two priority tiers:** foreground work created by a blocking call is always prioritized over background tasks created via `spawn`.
 1. **🔄💤 Spinning before sleeping:** threads will spin for a configurable interval before sleeping with the operating system scheduler.
 

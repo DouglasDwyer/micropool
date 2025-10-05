@@ -253,13 +253,13 @@ impl ThreadPool {
     /// elements. For alternatives, see [`Self::split_per`],
     /// [`Self::split_by`], and [`Self::split_by_threads`].
     pub fn split_per_item(&self) -> impl '_ + GenericThreadPool {
-        ThreadPerItem(self)
+        SplitPerItem(self)
     }
 
     /// Execute [`paralight`] iterators by batching elements.
     /// Each group of `chunk_size` elements may be processed by a single thread.
     pub fn split_per(&self, chunk_size: usize) -> impl '_ + GenericThreadPool {
-        ThreadPerChunk {
+        SplitPer {
             chunk_units_calculator: move |x| (chunk_size.max(1), x.div_ceil(chunk_size.max(1))),
             pool: self,
         }
@@ -269,7 +269,7 @@ impl ThreadPool {
     /// Every iterator will be broken up into `chunks`
     /// separate work units, which may be processed in parallel.
     pub fn split_by(&self, chunks: usize) -> impl '_ + GenericThreadPool {
-        ThreadPerChunk {
+        SplitPer {
             chunk_units_calculator: move |x| (x.div_ceil(chunks.max(1)), chunks.max(1)),
             pool: self,
         }
@@ -294,10 +294,10 @@ impl Drop for ThreadPool {
     }
 }
 
-/// Implementation for [`ThreadPool::with_thread_per_item`].
-struct ThreadPerItem<'a>(&'a ThreadPool);
+/// Implementation for [`ThreadPool::split_per_item`].
+struct SplitPerItem<'a>(&'a ThreadPool);
 
-impl<'a> GenericThreadPool for ThreadPerItem<'a> {
+impl<'a> GenericThreadPool for SplitPerItem<'a> {
     fn upper_bounded_pipeline<Output: Send, Accum>(
         self,
         input_len: usize,
@@ -360,14 +360,14 @@ impl<'a> GenericThreadPool for ThreadPerItem<'a> {
 
 /// Implementation for [`ThreadPool::split_per`], [`ThreadPool::split_by`], and
 /// [`ThreadPool::split_by_threads`].
-struct ThreadPerChunk<'a, F: Fn(usize) -> (usize, usize)> {
+struct SplitPer<'a, F: Fn(usize) -> (usize, usize)> {
     /// Maps the input iterator size to a chunk size and work unit count.
     chunk_units_calculator: F,
     /// The pool on which to spawn the work.
     pool: &'a ThreadPool,
 }
 
-impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for ThreadPerChunk<'a, F> {
+impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'a, F> {
     fn upper_bounded_pipeline<Output: Send, Accum>(
         self,
         input_len: usize,
