@@ -196,19 +196,56 @@ impl ThreadPool {
         self.join_handles.len()
     }
 
+    /// Takes two closures and *potentially* runs them in parallel. It
+    /// returns a pair of the results from those closures.
+    pub fn join<A, B, RA, RB>(&self, oper_a: A, oper_b: B) -> (RA, RB)
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
+    {
+        unsafe {
+            let oper_a_holder = MaybeUninit::new(oper_a);
+            let oper_b_holder = MaybeUninit::new(oper_b);
+
+            let result_a = UnsafeCell::new(MaybeUninit::uninit());
+            let result_b = UnsafeCell::new(MaybeUninit::uninit());
+
+            JoinPoint::invoke(
+                self.state,
+                |i| match i {
+                    0 => {
+                        (*result_a.get()).write(oper_a_holder.assume_init_read()());
+                    }
+                    1 => {
+                        (*result_b.get()).write(oper_b_holder.assume_init_read()());
+                    }
+                    _ => unreachable_unchecked(),
+                },
+                2,
+            );
+
+            (
+                result_a.into_inner().assume_init(),
+                result_b.into_inner().assume_init(),
+            )
+        }
+    }
+
     /// Execute [`paralight`] iterators with maximal parallelism.
     /// Every iterator item may be processed on a separate thread.
     /// 
     /// Note: by maximizing parallelism, this also maximizes overhead.
     /// This is best used with computationally-heavy iterators that have few elements.
     /// For alternatives, see [`Self::split_per`], [`Self::split_by`], and [`Self::split_by_threads`].
-    pub(crate) fn split_per_item(&self) -> impl '_ + GenericThreadPool {
+    pub fn split_per_item(&self) -> impl '_ + GenericThreadPool {
         ThreadPerItem(self)
     }
 
     /// Execute [`paralight`] iterators by batching elements.
     /// Each group of `chunk_size` elements may be processed by a single thread.
-    pub(crate) fn split_per(&self, chunk_size: usize) -> impl '_ + GenericThreadPool {
+    pub fn split_per(&self, chunk_size: usize) -> impl '_ + GenericThreadPool {
         ThreadPerChunk {
             chunk_units_calculator: move |x| (chunk_size.max(1), x.div_ceil(chunk_size.max(1))),
             pool: self,
@@ -218,7 +255,7 @@ impl ThreadPool {
     /// Execute [`paralight`] iterators by batching elements.
     /// Every iterator will be broken up into `chunks`
     /// separate work units, which may be processed in parallel.
-    pub(crate) fn split_by(&self, chunks: usize) -> impl '_ + GenericThreadPool {
+    pub fn split_by(&self, chunks: usize) -> impl '_ + GenericThreadPool {
         ThreadPerChunk {
             chunk_units_calculator: move |x| (x.div_ceil(chunks.max(1)), chunks.max(1)),
             pool: self,
@@ -228,7 +265,7 @@ impl ThreadPool {
     /// Execute [`paralight`] iterators by batching elements.
     /// Every iterator will be broken up into [`Self::num_threads`]
     /// separate work units, which may be processed in parallel.
-    pub(crate) fn split_by_threads(&self) -> impl '_ + GenericThreadPool {
+    pub fn split_by_threads(&self) -> impl '_ + GenericThreadPool {
         self.split_by(self.num_threads())
     }
 }

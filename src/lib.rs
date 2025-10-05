@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::thread::{self, available_parallelism, JoinHandle};
 
 use paralight::iter::GenericThreadPool;
+pub use paralight::iter;
 use smallvec::SmallVec;
 
 use self::join_point::*;
@@ -169,32 +170,7 @@ where
     RA: Send,
     RB: Send,
 {
-    unsafe {
-        let oper_a_holder = MaybeUninit::new(oper_a);
-        let oper_b_holder = MaybeUninit::new(oper_b);
-
-        let result_a = UnsafeCell::new(MaybeUninit::uninit());
-        let result_b = UnsafeCell::new(MaybeUninit::uninit());
-
-        JoinPoint::invoke(
-            todo!(),
-            |i| match i {
-                0 => {
-                    (*result_a.get()).write(oper_a_holder.assume_init_read()());
-                }
-                1 => {
-                    (*result_b.get()).write(oper_b_holder.assume_init_read()());
-                }
-                _ => unreachable_unchecked(),
-            },
-            2,
-        );
-
-        (
-            result_a.into_inner().assume_init(),
-            result_b.into_inner().assume_init(),
-        )
-    }
+    ThreadPool::with_current(|pool| pool.join(oper_a, oper_b))
 }
 
 /*
