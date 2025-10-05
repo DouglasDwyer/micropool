@@ -158,16 +158,6 @@ pub fn split_by_threads() -> impl GenericThreadPool {
     SplitByThreads
 }
 
-
-/*
-
-TODO:
-- Make thread pool global
-- Have options per-iterator via thread pool customization
-
-
-*/
-
 /// Takes two closures and *potentially* runs them in parallel. It
 /// returns a pair of the results from those closures.
 pub fn fork<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
@@ -381,9 +371,6 @@ mod tests {
     /// Tests that a parallel iterator can add things.
     #[test]
     fn test_add() {
-        let thread_pool = ThreadPoolBuilder::default()
-            .build();
-
         let len = 10_000;
         let mut output = vec![0; len];
         let left = (0..len as u64).collect::<Vec<u64>>();
@@ -400,7 +387,7 @@ mod tests {
             std::hint::black_box(right_slice).par_iter(),
         )
             .zip_eq()
-            .with_thread_pool(thread_pool.split_by_threads())
+            .with_thread_pool(crate::split_by_threads())
             .for_each(|(out, &a, &b)| *out = a + b);
 
         assert_eq!(output, expected_output);
@@ -409,15 +396,12 @@ mod tests {
     /// Tests that a parallel iterator can sum things.
     #[test]
     fn test_sum() {
-        let thread_pool = ThreadPoolBuilder::default()
-            .build();
-
         let len = 10_000;
         let input = (0..len as u64).collect::<Vec<u64>>();
         let input_slice = input.as_slice();
         let result = input_slice
             .par_iter()
-            .with_thread_pool(thread_pool.split_by_threads())
+            .with_thread_pool(crate::split_by_threads())
             .sum::<u64>();
         assert_eq!(result, 49995000);
     }

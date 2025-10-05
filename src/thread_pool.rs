@@ -15,6 +15,11 @@ use crate::util::*;
 /// The global thread pool.
 static GLOBAL_POOL: spin::Once<ThreadPool> = spin::Once::new();
 
+thread_local! {
+    /// The thread pool that is locally active due to [`ThreadPool::install`].
+    static LOCAL_POOL: UnsafeCell<*const ThreadPool> = UnsafeCell::new(std::ptr::null());
+}
+
 /// Determines how a thread pool will behave.
 pub struct ThreadPoolBuilder {
     /// Threads waiting for work will spin at least this many cycles before sleeping.
@@ -38,7 +43,15 @@ impl ThreadPoolBuilder {
     /// 
     /// Panics if the global thread pool was already initialized.
     pub fn build_global(self) {
-        todo!()
+        let mut run = false;
+        GLOBAL_POOL.call_once(|| {
+            run = true;
+            ThreadPoolBuilder::default().build()
+        });
+
+        if !run {
+            panic!("ThreadPoolBuilder::build_global called after global pool was already active");
+        }
     }
 
     /// Threads waiting for work will spin at least this many cycles before sleeping.
@@ -114,14 +127,39 @@ impl ThreadPool {
         }
     }
 
-    pub fn install() {
-        todo!()
+    /// Changes the current context to this thread pool. Any attempts to use [`crate::join`]
+    /// or parallel iterators will operate within this pool.
+    /// 
+    /// Panics if called from within a parallel iterator or other asynchronous task.
+    pub fn install<R>(&self, f: impl FnOnce() -> R) -> R {
+        unsafe {
+            assert!(JoinPoint::current().is_none(), "Attempted to enter pool from within another context.");
+            LOCAL_POOL.with(|x| {
+                let _guard = PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
+                let previous = *x.get();
+                *x.get() = self;
+                let result = f();
+                *x.get() = previous;
+                result
+            })
+        }
     }
     
     /// Executes `f` within the context of the current thread pool.
     /// Initializes the global thread pool if no other pool is active.
     pub(crate) fn with_current<R>(f: impl FnOnce(&ThreadPool) -> R) -> R {
-        todo!()
+        unsafe {
+            LOCAL_POOL.with(|x| {
+                let value = &mut *x.get();
+                
+                if value.is_null() {
+                    *value = GLOBAL_POOL.call_once(|| ThreadPoolBuilder::default().build());
+                }
+
+                let pool_ptr = *value;
+                f(&*pool_ptr)
+            })   
+        }
     }
 
     /// The total number of worker threads in this pool.
@@ -135,13 +173,13 @@ impl ThreadPool {
     /// Note: by maximizing parallelism, this also maximizes overhead.
     /// This is best used with computationally-heavy iterators that have few elements.
     /// For alternatives, see [`Self::split_per`], [`Self::split_by`], and [`Self::split_by_threads`].
-    pub fn split_per_item(&self) -> impl '_ + GenericThreadPool {
+    pub(crate) fn split_per_item(&self) -> impl '_ + GenericThreadPool {
         ThreadPerItem(self)
     }
 
     /// Execute [`paralight`] iterators by batching elements.
     /// Each group of `chunk_size` elements may be processed by a single thread.
-    pub fn split_per(&self, chunk_size: usize) -> impl '_ + GenericThreadPool {
+    pub(crate) fn split_per(&self, chunk_size: usize) -> impl '_ + GenericThreadPool {
         ThreadPerChunk {
             chunk_units_calculator: move |x| (chunk_size.max(1), x.div_ceil(chunk_size.max(1))),
             pool: self,
@@ -151,7 +189,7 @@ impl ThreadPool {
     /// Execute [`paralight`] iterators by batching elements.
     /// Every iterator will be broken up into `chunks`
     /// separate work units, which may be processed in parallel.
-    pub fn split_by(&self, chunks: usize) -> impl '_ + GenericThreadPool {
+    pub(crate) fn split_by(&self, chunks: usize) -> impl '_ + GenericThreadPool {
         ThreadPerChunk {
             chunk_units_calculator: move |x| (x.div_ceil(chunks.max(1)), chunks.max(1)),
             pool: self,
@@ -161,7 +199,7 @@ impl ThreadPool {
     /// Execute [`paralight`] iterators by batching elements.
     /// Every iterator will be broken up into [`Self::num_threads`]
     /// separate work units, which may be processed in parallel.
-    pub fn split_by_threads(&self) -> impl '_ + GenericThreadPool {
+    pub(crate) fn split_by_threads(&self) -> impl '_ + GenericThreadPool {
         self.split_by(self.num_threads())
     }
 }

@@ -53,17 +53,19 @@ mod micropool {
         num_threads: usize,
         len: &usize,
     ) {
-        let input = (0..*len as u64).collect::<Vec<u64>>();
-        let input_slice = input.as_slice();
-        let pool = micropool::ThreadPoolBuilder::default()
-            .num_threads(num_threads)
-            .build();
-
-        bencher.iter(|| {
-            black_box(input_slice)
-                .par_iter()
-                .with_thread_pool(pool.split_by_threads())
-                .sum::<u64>()
+        micropool::ThreadPoolBuilder::default()
+            .num_threads(num_threads - 1)
+            .build()
+            .install(|| {
+            let input = (0..*len as u64).collect::<Vec<u64>>();
+            let input_slice = input.as_slice();
+            
+            bencher.iter(|| {
+                black_box(input_slice)
+                    .par_iter()
+                    .with_thread_pool(micropool::split_by_threads())
+                    .sum::<u64>()
+            });
         });
     }
 
@@ -72,27 +74,28 @@ mod micropool {
         num_threads: usize,
         len: &usize,
     ) {
-        let mut output = vec![0; *len];
-        let left = (0..*len as u64).collect::<Vec<u64>>();
-        let right = (0..*len as u64).collect::<Vec<u64>>();
+        micropool::ThreadPoolBuilder::default()
+            .num_threads(num_threads - 1)
+            .build()
+            .install(|| {
+            let mut output = vec![0; *len];
+            let left = (0..*len as u64).collect::<Vec<u64>>();
+            let right = (0..*len as u64).collect::<Vec<u64>>();
 
-        let output_slice = output.as_mut_slice();
-        let left_slice = left.as_slice();
-        let right_slice = right.as_slice();
+            let output_slice = output.as_mut_slice();
+            let left_slice = left.as_slice();
+            let right_slice = right.as_slice();
 
-        let pool = micropool::ThreadPoolBuilder::default()
-            .num_threads(num_threads)
-            .build();
-
-        bencher.iter(|| {
-            (
-                black_box(output_slice.par_iter_mut()),
-                black_box(left_slice).par_iter(),
-                black_box(right_slice).par_iter(),
-            )
-                .zip_eq()
-                .with_thread_pool(pool.split_by_threads())
-                .for_each(|(out, &a, &b)| *out = a + b)
+            bencher.iter(|| {
+                (
+                    black_box(output_slice.par_iter_mut()),
+                    black_box(left_slice).par_iter(),
+                    black_box(right_slice).par_iter(),
+                )
+                    .zip_eq()
+                    .with_thread_pool(micropool::split_by_threads())
+                    .for_each(|(out, &a, &b)| *out = a + b)
+            });
         });
     }
 }
