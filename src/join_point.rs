@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use smallvec::SmallVec;
 
+use crate::{TaskInner, TaskState};
 use crate::thread_pool::ThreadPoolState;
 use crate::util::*;
 
@@ -17,8 +18,10 @@ thread_local! {
     static CURRENT_JOIN_POINT: UnsafeCell<Option<JoinPoint>> = const { UnsafeCell::new(None) };
 }
 
-/// Tracks a point in the call stack where control flow was split across
-/// multiple threads.
+/// References a point in the call stack where control flow was split across multiple threads.
+/// Allows for waiting for the call to complete.
+/// 
+/// **Note:** control flow will not leave a join point until all [`JoinPoint`] references are dropped!
 #[derive(Clone)]
 pub struct JoinPoint(ScopedRef<JoinPointInner>);
 
@@ -86,6 +89,63 @@ impl JoinPoint {
                         },
                     );
                 }
+            }
+        }
+    }
+
+    /// Begins running `task`. If the task was already started on another
+    /// thread, then joins with that task.
+    /// 
+    /// If `join_work_only` is true, then this function may return early
+    /// (before the task is complete) while other threads finish their work.
+    pub fn join_task(task: &dyn TaskInner, join_work_only: bool) {
+        unsafe {
+            let mut state_lock = task.state().write();
+
+            match state_lock.clone() {
+                TaskState::NotStarted => {
+                    let previous = Self::current();
+                    let on_change = Event::new();
+                    let f = |_| task.run();
+
+                    ScopedRef::of(
+                        JoinPointInner {
+                            children: spin::RwLock::new(SmallVec::new()),
+                            completed_invocations: AtomicU64::new(0),
+                            func: &f as *const _ as *const _,
+                            on_change: &on_change,
+                            parent: None,
+                            pool: task.pool(),
+                            started_invocations: AtomicU64::new(1),
+                            total_invocations: 1,
+                        },
+                        move |inner| {
+                            let join_point = JoinPoint(inner);
+                            
+                            *state_lock = TaskState::Running(join_point.clone());
+                            drop(state_lock);
+
+                            join_point.0.pool.roots.write().push(join_point.clone());
+
+                            Self::set_current(Some(join_point.clone()));
+
+                            join_point.invoke_work_unit(0);
+
+                            *task.state().write() = TaskState::Complete;
+                            Self::set_current(previous);
+                        },
+                    );
+                },
+                TaskState::Running(join_point) => {
+                    drop(state_lock);
+                    if join_work_only {
+                        join_point.join_work();
+                    }
+                    else {
+                        join_point.join();
+                    }
+                },
+                TaskState::Complete => {}
             }
         }
     }
@@ -211,7 +271,7 @@ impl JoinPoint {
 
         let mut spin_before_sleep = true;
         loop {
-            let listener = unsafe { (*self.0.on_change).listen() }; // todo: no more raw ptr
+            let listener = unsafe { (*self.0.on_change).listen() };
             if self.0.completed_invocations.load(Ordering::Acquire) < self.0.total_invocations {
                 if self.invoke_child_work() {
                     spin_before_sleep = true;
@@ -253,6 +313,9 @@ impl PartialEq for JoinPoint {
         ScopedRef::ptr_eq(&self.0, &other.0)
     }
 }
+
+unsafe impl Send for JoinPoint {}
+unsafe impl Sync for JoinPoint {}
 
 /// Holds the inner state for a [`JoinPoint`].
 struct JoinPointInner {

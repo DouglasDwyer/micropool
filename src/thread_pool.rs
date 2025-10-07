@@ -1,14 +1,16 @@
 use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::hint::unreachable_unchecked;
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle, available_parallelism};
 
 use paralight::iter::GenericThreadPool;
 use smallvec::SmallVec;
 
-use crate::join_point::*;
+use crate::{join_point::*, Task, TaskInner};
 use crate::util::*;
 
 /// The global thread pool.
@@ -171,6 +173,12 @@ impl ThreadPool {
                 result
             })
         }
+    }
+
+    /// Spawns an asynchronous task on the global thread pool.
+    /// The returned handle can be used to obtain the result.
+    pub fn spawn<T: 'static>(&self, f: impl 'static + FnOnce() -> T + Send) -> Task<T> {
+        Task::spawn(self.state, f)
     }
 
     /// Executes `f` within the context of the current thread pool.
@@ -384,7 +392,6 @@ impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'a, F> {
             output.reserve_exact(work_units);
             let output_buffer = output.as_mut_ptr();
 
-            // todo: break and cleanup with atomic
             JoinPoint::invoke(
                 self.pool.state,
                 |i| {
@@ -456,6 +463,8 @@ pub(crate) struct ThreadPoolState {
     /// Whether the parent [`ThreadPool`] is being dropped.
     /// This indicates that workers should exit.
     pub should_stop: AtomicBool,
+    /// The tasks that are currently in progress.
+    pub tasks: spin::Mutex<VecDeque<Arc<dyn TaskInner>>>
 }
 
 impl ThreadPoolState {
@@ -466,7 +475,21 @@ impl ThreadPoolState {
             on_change: Event::new(),
             roots: spin::RwLock::new(Vec::new()),
             should_stop: AtomicBool::new(false),
+            tasks: spin::Mutex::new(VecDeque::new())
         }
+    }
+
+    /// Removes the provided task from the queue if it is found.
+    pub fn cancel_task<U: ?Sized>(&self, task: &Arc<U>) {
+        let mut tasks = self.tasks.lock();
+        if let Some(index) = tasks.iter().position(|x| Arc::as_ptr(x).cast::<()>() == Arc::as_ptr(task).cast::<()>()) {
+            tasks.swap_remove_back(index);
+        }
+    }
+
+    /// Schedules a task to be run on the pool.
+    pub fn push_task(&self, task: Arc<dyn TaskInner>) {
+        self.tasks.lock().push_back(task);
     }
 
     /// Polls for available work on the thread pool, and goes to sleep if none
@@ -493,6 +516,8 @@ impl ThreadPoolState {
                 JoinPoint::set_current(None);
             } else if self.should_stop.load(Ordering::Acquire) {
                 return;
+            } else if let Some(task) = self.pop_task() {
+                JoinPoint::join_task(&*task, true);
             } else {
                 // Only spin if something was found to do since the last sleep
                 let spin_cycles = if spin_before_sleep {
@@ -503,6 +528,11 @@ impl ThreadPoolState {
                 spin_before_sleep = !listener.spin_wait(spin_cycles);
             }
         }
+    }
+
+    /// Removes a task from the queue, if one is available.
+    fn pop_task(&self) -> Option<Arc<dyn TaskInner>> {
+        self.tasks.lock().pop_front()
     }
 }
 

@@ -5,10 +5,14 @@
 pub use paralight::iter;
 use paralight::iter::GenericThreadPool;
 
+pub use self::task::*;
 pub use self::thread_pool::*;
 
 /// Internal tracking for work trees executing on a thread pool.
 mod join_point;
+
+/// Implementation of tasks for the [`spawn`] API.
+mod task;
 
 /// The primary thread pool interface.
 mod thread_pool;
@@ -214,176 +218,14 @@ where
 
 /// Spawns an asynchronous task on the global thread pool.
 /// The returned handle can be used to obtain the result.
-pub fn spawn<T>(f: impl 'static + Send + FnOnce() -> T) -> Task<T> {
-    Task(std::marker::PhantomData)
+pub fn spawn<T: 'static>(f: impl 'static + Send + FnOnce() -> T) -> Task<T> {
+    ThreadPool::with_current(|pool| pool.spawn(f))
 }
 
-/// A handle to a queued group of work units, which output a single result.
-pub struct Task<T>(std::marker::PhantomData<T>);
-
-/*
-impl<T> Task<T> {
-    /// Cancels this task, preventing it from running if it was not yet started.
-    pub fn cancel(self) {
-        todo!()
-    }
-
-    /// Whether the task has been completed yet.
-    pub fn complete(&self) -> bool {
-        todo!()
-    }
-
-    /// Attempts to get the result of this task if it has been completed. Otherwise, returns
-    /// the original task.
-    pub fn result(self) -> Result<T, Self> {
-        if self.complete() {
-            Ok(self.join())
-        } else {
-            Err(self)
-        }
-    }
-
-    /// Joins the current thread with this task, completing all remaining work.
-    /// After all work is complete, yields the result.
-    pub fn join(self) -> T {
-        let join_point: &JoinPoint = todo!();
-        join_point.join();
-
-        unsafe { (*self.0.result.get()).take().unwrap_unchecked() }
-    }
-
-    /// Joins with the remaining work on this task, completing all units while they are
-    /// available. Returns immediately if there are outstanding units in progress on other threads.
-    pub fn join_work(&self) {
-        let join_point: &JoinPoint = todo!();
-        join_point.join_work();
-    }
-}
-
-/*
-impl<T> Future for Task<T> {
-    type Output = T;
-
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        /*unsafe {
-            if self.complete() {
-                Poll::Ready(self.get_result())
-            } else {
-                self.control.set_result_waker(cx.waker().clone());
-                Poll::Pending
-            }
-        }*/
-        todo!("Poll work and stih?")
-    }
-} */
-
-trait TaskInner {
-    fn set_join_point(&self, point: Option<JoinPoint>);
-
-    unsafe fn invoke_work_unit(&self, i: usize);
-
-    fn work_units(&self) -> usize;
-}
-
-struct TaskInnerImpl<T> {
-    //root: spin::RwLock<JoinPoint>,
-    /// The result of the task, if it is available.
-    result: UnsafeCell<Option<T>>
-}
-
-/*
-/// A structure which interally alerts a condvar upon wake.
-#[derive(Clone, Default)]
-struct CondvarWaker {
-    /// The inner backing for the waker.
-    inner: Arc<CondvarWakerInner>,
-}
-
-impl CondvarWaker {
-    /// Converts this to a waker.
-    pub fn as_waker(&self) -> Waker {
-        unsafe {
-            Waker::from_raw(Self::clone_waker(
-                &self.inner as *const Arc<CondvarWakerInner> as *const (),
-            ))
-        }
-    }
-
-    /// Clones the waker.
-    ///
-    /// # Safety
-    ///
-    /// For this function to be sound, inner must be a valid pointer to an `Arc<CondvarWakerInner>`.
-    unsafe fn clone_waker(inner: *const ()) -> RawWaker {
-        unsafe {
-            let value = &*(inner as *const Arc<CondvarWakerInner>);
-            let data = Box::into_raw(Box::new(value.clone()));
-
-            RawWaker::new(
-                data as *const (),
-                &RawWakerVTable::new(
-                    Self::clone_waker,
-                    Self::wake_waker,
-                    Self::wake_by_ref_waker,
-                    Self::drop_waker,
-                ),
-            )
-        }
-    }
-
-    /// Wakes the waker, and consumes the pointer.
-    ///
-    /// # Safety
-    ///
-    /// For this function to be sound, inner must be a valid owned pointer to an `Arc<CondvarWakerInner>`.
-    unsafe fn wake_waker(inner: *const ()) {
-        Self::wake_by_ref_waker(inner);
-        Self::drop_waker(inner);
-    }
-
-    /// Wakes the waker.
-    ///
-    /// # Safety
-    ///
-    /// For this function to be sound, inner must be a valid pointer to an `Arc<CondvarWakerInner>`.
-    #[allow(unused_variables)]
-    unsafe fn wake_by_ref_waker(inner: *const ()) {
-        let inner = &*(inner as *const Arc<CondvarWakerInner>);
-        let guard = inner.lock.lock().expect("Could not lock mutex");
-        inner.on_wake.notify_all();
-    }
-
-    /// Drops the waker, consuming the given pointer.
-    ///
-    /// # Safety
-    ///
-    /// For this function to be sound, inner must be a valid owned pointer to an `Arc<CondvarWakerInner>`.
-    unsafe fn drop_waker(inner: *const ()) {
-        drop(Box::from_raw(inner as *mut Arc<CondvarWakerInner>));
-    }
-}
-
-impl Deref for CondvarWaker {
-    type Target = CondvarWakerInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-/// Stores the inner state for a condition variable waker.
-#[derive(Default)]
-struct CondvarWakerInner {
-    /// The lock that should be used for waiting.
-    lock: sync_impl::Mutex<()>,
-    /// The condition variable that is alerted on wake.
-    on_wake: sync_impl::Condvar,
-} */ */
-
+/// Tests for `micropool`.
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use paralight::iter::*;
+    use crate::iter::*;
 
     /// Tests that a parallel iterator can add things.
     #[test]
@@ -423,81 +265,34 @@ mod tests {
         assert_eq!(result, 49995000);
     }
 
-    /*use futures_executor::*;
-
-    async fn execute_background() {
-        let queue = TaskQueue::<Fifo>::default();
-        TaskPool::new(queue.clone(), 4).forget();
-
+    /// Tests a simple for each loop.
+    #[test]
+    fn test_for_each() {
+        let mut result = [0; 5];
+        (result.par_iter_mut(), (1..=5).into_par_iter())
+            .zip_eq()
+            .with_thread_pool(crate::split_by_threads())
+            .for_each(|(out, x)| *out = x * x - 1);
         assert_eq!(
-            queue
-                .spawn(once(|| {
-                    println!("This will execute on background thread.");
-                    2
-                }))
-                .await,
-            2
+            [0, 3, 8, 15, 24],
+            result
         );
     }
-
+    
+    /// Spawns and joins many tasks.
     #[test]
     fn execute_many() {
-        let queue_a = TaskQueue::<Fifo>::default();
-        assert_eq!(
-            &[0, 3, 8, 15, 24][..],
-            &queue_a.join(many((1..=5).map(|x| move || x * x - 1)))
-        );
-    }
-
-    #[test]
-    fn execute_double() {
-        let queue_a = TaskQueue::<Fifo>::default();
-        let queue_b = TaskQueue::<Lifo>::default();
-
-        let first_task = queue_a.spawn(once(|| 2));
-        let second_task = queue_b.spawn(once(|| 2));
-
-        TaskPool::new(
-            ChainedWorkProvider::default()
-                .with(queue_a.clone())
-                .with(queue_b.clone()),
-            4,
-        )
-        .forget();
-
-        assert_eq!(first_task.join(), second_task.join());
-    }
-
-    #[test]
-    fn execute_double_twice() {
-        let queue_a = TaskQueue::<Fifo>::default();
-        let queue_b = TaskQueue::<Lifo>::default();
-
-        let first_task = queue_a.spawn(once(|| 2));
-        let second_task = queue_b.spawn(once(|| 2));
-
-        TaskPool::new(
-            ChainedWorkProvider::default()
-                .with(queue_a.clone())
-                .with(queue_b.clone()),
-            1,
-        )
-        .forget();
-
+        let first_task = crate::spawn(|| 2);
+        let second_task = crate::spawn(|| 2);
         assert_eq!(first_task.join(), second_task.join());
 
-        for _i in 0..1000 {
+        for _ in 0..1000 {
             let third_task =
-                queue_a.spawn(once(|| std::thread::sleep(std::time::Duration::new(0, 10))));
-            let fourth_task = queue_b.spawn(once(|| {
+                crate::spawn(|| std::thread::sleep(std::time::Duration::new(0, 10)));
+            let fourth_task = crate::spawn(|| {
                 std::thread::sleep(std::time::Duration::new(0, 200))
-            }));
+            });
             assert_eq!(third_task.join(), fourth_task.join());
         }
     }
-
-    #[test]
-    fn execute_background_blocking() {
-        block_on(execute_background());
-    }*/
 }

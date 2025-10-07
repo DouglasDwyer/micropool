@@ -153,6 +153,9 @@ impl<T> Drop for ScopedRef<T> {
     }
 }
 
+unsafe impl<T: Send + Sync> Send for ScopedRef<T> {}
+unsafe impl<T: Send + Sync> Sync for ScopedRef<T> {}
+
 /// Stores the inner state for a [`ScopedRef`].
 struct ScopedHolder<T> {
     /// The number of active references to this holder.

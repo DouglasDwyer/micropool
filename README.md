@@ -13,6 +13,24 @@
 
 ### Usage
 
+#### Foreground work with `join`
+
+A single operation can be split between two threads using the `join` primitive:
+
+```rust
+micropool::join(|| {
+    println!("A {:?}", std::thread::current().id());
+}, || {
+    println!("B {:?}", std::thread::current().id());
+});
+
+// Possible output:
+// B ThreadId(2)
+// A ThreadId(1)
+```
+
+#### Foreground work with parallel iterators
+
 Parallel iterators allow for splitting common list operations across multiple threads. `micropool` re-exports the [`paralight`](https://github.com/gendx/paralight) library:
 
 ```rust
@@ -30,6 +48,20 @@ assert_eq!(result, 49995000);
 ```
 
 The `.with_thread_pool` line specifies that the current `micropool` instance should be used, and `split_by_threads` indicates that each pool thread should process an equal-sized chunk of the data. Other data-splitting strategies available are `split_by`, `split_per_item`, and `split_per`.
+
+#### Background work with `spawn`
+
+Tasks can be spawned asynchronously, then `join`ed later:
+
+```rust
+let task = micropool::spawn(|| 2 + 2);
+println!("Is my task complete yet? {}", task.complete());
+println!("The result: {}", task.join());
+
+// Possible output:
+// Is my task complete yet? false
+// The result: 4
+```
 
 ### Scheduling system
 
