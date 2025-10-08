@@ -3,15 +3,16 @@ use std::collections::VecDeque;
 use std::hint::unreachable_unchecked;
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle, available_parallelism};
 
 use paralight::iter::GenericThreadPool;
 use smallvec::SmallVec;
 
-use crate::{join_point::*, Task, TaskInner};
+use crate::join_point::*;
 use crate::util::*;
+use crate::{Task, TaskInner};
 
 /// The global thread pool.
 static GLOBAL_POOL: spin::Once<ThreadPool> = spin::Once::new();
@@ -27,6 +28,10 @@ thread_local! {
     static LOCAL_POOL: UnsafeCell<*const ThreadPool> = const { UnsafeCell::new(std::ptr::null()) };
 }
 
+/// The function signature for the [`ThreadPoolBuilder::spawn_handler`]
+/// function.
+type ThreadSpawnerFn = dyn FnMut(usize, Box<dyn FnOnce() + Send>) -> JoinHandle<()>;
+
 /// Determines how a thread pool will behave.
 pub struct ThreadPoolBuilder {
     /// Threads waiting for work will spin at least this many cycles before
@@ -35,7 +40,7 @@ pub struct ThreadPoolBuilder {
     /// The number of threads to spawn.
     num_threads: usize,
     /// The function to use when spawning new threads.
-    spawn_handler: Box<dyn FnMut(usize, Box<dyn FnOnce() + Send>) -> JoinHandle<()>>,
+    spawn_handler: Box<ThreadSpawnerFn>,
 }
 
 impl ThreadPoolBuilder {
@@ -464,7 +469,7 @@ pub(crate) struct ThreadPoolState {
     /// This indicates that workers should exit.
     pub should_stop: AtomicBool,
     /// The tasks that are currently in progress.
-    pub tasks: spin::Mutex<VecDeque<Arc<dyn TaskInner>>>
+    pub tasks: spin::Mutex<VecDeque<Arc<dyn TaskInner>>>,
 }
 
 impl ThreadPoolState {
@@ -475,14 +480,17 @@ impl ThreadPoolState {
             on_change: Event::new(),
             roots: spin::RwLock::new(Vec::new()),
             should_stop: AtomicBool::new(false),
-            tasks: spin::Mutex::new(VecDeque::new())
+            tasks: spin::Mutex::new(VecDeque::new()),
         }
     }
 
     /// Removes the provided task from the queue if it is found.
     pub fn cancel_task<U: ?Sized>(&self, task: &Arc<U>) {
         let mut tasks = self.tasks.lock();
-        if let Some(index) = tasks.iter().position(|x| Arc::as_ptr(x).cast::<()>() == Arc::as_ptr(task).cast::<()>()) {
+        if let Some(index) = tasks
+            .iter()
+            .position(|x| Arc::as_ptr(x).cast::<()>() == Arc::as_ptr(task).cast::<()>())
+        {
             tasks.swap_remove_back(index);
         }
     }

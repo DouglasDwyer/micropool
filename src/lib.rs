@@ -273,12 +273,9 @@ mod tests {
             .zip_eq()
             .with_thread_pool(crate::split_by_threads())
             .for_each(|(out, x)| *out = x * x - 1);
-        assert_eq!(
-            [0, 3, 8, 15, 24],
-            result
-        );
+        assert_eq!([0, 3, 8, 15, 24], result);
     }
-    
+
     /// Spawns and joins many tasks.
     #[test]
     fn execute_many() {
@@ -287,11 +284,8 @@ mod tests {
         assert_eq!(first_task.join(), second_task.join());
 
         for _ in 0..1000 {
-            let third_task =
-                crate::spawn(|| std::thread::sleep(std::time::Duration::new(0, 10)));
-            let fourth_task = crate::spawn(|| {
-                std::thread::sleep(std::time::Duration::new(0, 200))
-            });
+            let third_task = crate::spawn(|| std::thread::sleep(std::time::Duration::new(0, 10)));
+            let fourth_task = crate::spawn(|| std::thread::sleep(std::time::Duration::new(0, 200)));
             assert_eq!(third_task.join(), fourth_task.join());
         }
     }

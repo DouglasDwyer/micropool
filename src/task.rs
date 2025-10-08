@@ -8,12 +8,15 @@ pub struct Task<T: 'static>(Arc<dyn TypedTaskInner<T>>);
 
 impl<T: 'static> Task<T> {
     /// Spawns a new task on the given pool.
-    pub(crate) fn spawn(pool: &'static ThreadPoolState, f: impl 'static + FnOnce() -> T + Send) -> Self {
+    pub(crate) fn spawn(
+        pool: &'static ThreadPoolState,
+        f: impl 'static + FnOnce() -> T + Send,
+    ) -> Self {
         let inner = Arc::new(TaskInnerHolder {
             func: spin::Mutex::new(Some(f)),
             pool,
             state: spin::RwLock::new(TaskState::NotStarted),
-            result: spin::Mutex::new(None)
+            result: spin::Mutex::new(None),
         });
 
         pool.push_task(inner.clone());
@@ -47,9 +50,10 @@ impl<T: 'static> Task<T> {
         JoinPoint::join_task(&*self.0, false);
         self.0.take_result()
     }
-    
+
     /// Joins with the remaining work on this task.
-    /// Returns immediately if there are outstanding units in progress on other threads.
+    /// Returns immediately if there are outstanding units in progress on other
+    /// threads.
     pub fn join_work(&self) {
         JoinPoint::join_task(&*self.0, true);
     }
@@ -85,12 +89,12 @@ struct TaskInnerHolder<T, F: FnOnce() -> T + Send> {
     /// The result of the task, if any.
     result: spin::Mutex<Option<T>>,
     /// The state tracker for the task.
-    state: spin::RwLock<TaskState>
+    state: spin::RwLock<TaskState>,
 }
 
 impl<T, F: FnOnce() -> T + Send> TaskInner for TaskInnerHolder<T, F> {
     fn pool(&self) -> &'static ThreadPoolState {
-        &self.pool
+        self.pool
     }
 
     fn state(&self) -> &spin::RwLock<TaskState> {
@@ -98,7 +102,11 @@ impl<T, F: FnOnce() -> T + Send> TaskInner for TaskInnerHolder<T, F> {
     }
 
     fn run(&self) {
-        let result = self.func.lock().take().expect("TaskInner::run called multiple times")();
+        let result = self
+            .func
+            .lock()
+            .take()
+            .expect("TaskInner::run called multiple times")();
         *self.result.lock() = Some(result);
     }
 }
@@ -109,7 +117,10 @@ impl<T, F: FnOnce() -> T + Send> TypedTaskInner<T> for TaskInnerHolder<T, F> {
     }
 
     fn take_result(&self) -> T {
-        self.result.lock().take().expect("Failed to get result of task")
+        self.result
+            .lock()
+            .take()
+            .expect("Failed to get result of task")
     }
 }
 
@@ -121,5 +132,5 @@ pub(crate) enum TaskState {
     /// The task is running with the given root join point.
     Running(JoinPoint),
     /// The task has finished execution.
-    Complete
+    Complete,
 }

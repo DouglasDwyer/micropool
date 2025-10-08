@@ -1,7 +1,7 @@
 use std::hint::{black_box, spin_loop};
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::thread::{self};
 
 /// Gets the first index of `value` within `slice`, or returns [`None`] if
@@ -16,21 +16,21 @@ pub fn index_of<T: PartialEq>(value: &T, slice: &[T]) -> Option<usize> {
 #[derive(Debug, Default)]
 pub struct Event {
     /// The version number - incremented each time the event changes.
-    version: AtomicU64,
+    version: AtomicU32,
 }
 
 impl Event {
     /// Initializes a new event.
     pub const fn new() -> Self {
         Self {
-            version: AtomicU64::new(0),
+            version: AtomicU32::new(0),
         }
     }
 
     /// Notifies all listeners that this event has changed.
     pub fn notify(&self) {
         self.version.fetch_add(1, Ordering::Release);
-        atomic_wait::wake_all(self.atomic_address());
+        atomic_wait::wake_all(&self.version);
     }
 
     /// Begins listening for changes to `self`. The event listener
@@ -41,11 +41,6 @@ impl Event {
             version: self.version.load(Ordering::Acquire),
         }
     }
-
-    /// Gets the atomic address on which to wait for events.
-    fn atomic_address(&self) -> &AtomicU32 {
-        unsafe { &*(&self.version as *const _ as *const _) }
-    }
 }
 
 /// Allows for waiting for an [`Event`] to change.
@@ -54,7 +49,7 @@ pub struct EventListener<'a> {
     /// The event in question.
     event: &'a Event,
     /// The version number of the event when this listener was created.
-    version: u64,
+    version: u32,
 }
 
 impl<'a> EventListener<'a> {
@@ -88,7 +83,7 @@ impl<'a> EventListener<'a> {
     /// called at least once since this object's creation.
     pub fn wait(&self) {
         while !self.signaled() {
-            atomic_wait::wait(self.event.atomic_address(), self.version as u32);
+            atomic_wait::wait(&self.event.version, self.version);
         }
     }
 }
@@ -118,6 +113,7 @@ impl<T> ScopedRef<T> {
             ref_count: AtomicUsize::new(1),
             value,
         };
+        let _dropper = ScopedHolderDropper(&holder);
         scope(ScopedRef(NonNull::from_ref(&holder)))
     }
 
@@ -164,9 +160,13 @@ struct ScopedHolder<T> {
     value: T,
 }
 
-impl<T> Drop for ScopedHolder<T> {
+/// Ensures that [`ScopedHolder`] is not freed until all references
+/// to it are dropped.
+struct ScopedHolderDropper<'a, T>(&'a ScopedHolder<T>);
+
+impl<T> Drop for ScopedHolderDropper<'_, T> {
     fn drop(&mut self) {
-        while 0 < self.ref_count.load(Ordering::Acquire) {
+        while 0 < self.0.ref_count.load(Ordering::Acquire) {
             spin_loop();
         }
     }

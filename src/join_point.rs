@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use smallvec::SmallVec;
 
-use crate::{TaskInner, TaskState};
 use crate::thread_pool::ThreadPoolState;
 use crate::util::*;
+use crate::{TaskInner, TaskState};
 
 /// The last join point entered by this thread, if any.
 #[cfg(nightly)]
@@ -18,10 +18,11 @@ thread_local! {
     static CURRENT_JOIN_POINT: UnsafeCell<Option<JoinPoint>> = const { UnsafeCell::new(None) };
 }
 
-/// References a point in the call stack where control flow was split across multiple threads.
-/// Allows for waiting for the call to complete.
-/// 
-/// **Note:** control flow will not leave a join point until all [`JoinPoint`] references are dropped!
+/// References a point in the call stack where control flow was split across
+/// multiple threads. Allows for waiting for the call to complete.
+///
+/// **Note:** control flow will not leave a join point until all [`JoinPoint`]
+/// references are dropped!
 #[derive(Clone)]
 pub struct JoinPoint(ScopedRef<JoinPointInner>);
 
@@ -95,7 +96,7 @@ impl JoinPoint {
 
     /// Begins running `task`. If the task was already started on another
     /// thread, then joins with that task.
-    /// 
+    ///
     /// If `join_work_only` is true, then this function may return early
     /// (before the task is complete) while other threads finish their work.
     pub fn join_task(task: &dyn TaskInner, join_work_only: bool) {
@@ -121,7 +122,7 @@ impl JoinPoint {
                         },
                         move |inner| {
                             let join_point = JoinPoint(inner);
-                            
+
                             *state_lock = TaskState::Running(join_point.clone());
                             drop(state_lock);
 
@@ -135,16 +136,15 @@ impl JoinPoint {
                             Self::set_current(previous);
                         },
                     );
-                },
+                }
                 TaskState::Running(join_point) => {
                     drop(state_lock);
                     if join_work_only {
                         join_point.join_work();
-                    }
-                    else {
+                    } else {
                         join_point.join();
                     }
-                },
+                }
                 TaskState::Complete => {}
             }
         }
