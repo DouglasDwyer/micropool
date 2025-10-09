@@ -1,8 +1,9 @@
 use std::hint::{black_box, spin_loop};
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self};
+use wait_on_address::AtomicWait;
 
 /// Gets the first index of `value` within `slice`, or returns [`None`] if
 /// it was not found.
@@ -16,21 +17,26 @@ pub fn index_of<T: PartialEq>(value: &T, slice: &[T]) -> Option<usize> {
 #[derive(Debug, Default)]
 pub struct Event {
     /// The version number - incremented each time the event changes.
-    version: AtomicU32,
+    version: AtomicU64,
+    /// The number of listeners that have begun sleeping.
+    waiting_listeners: AtomicU32
 }
 
 impl Event {
     /// Initializes a new event.
     pub const fn new() -> Self {
         Self {
-            version: AtomicU32::new(0),
+            version: AtomicU64::new(0),
+            waiting_listeners: AtomicU32::new(0)
         }
     }
 
     /// Notifies all listeners that this event has changed.
     pub fn notify(&self) {
         self.version.fetch_add(1, Ordering::Release);
-        atomic_wait::wake_all(&self.version);
+        if 0 < self.waiting_listeners.load(Ordering::Acquire) {
+            self.version.notify_all();
+        }
     }
 
     /// Begins listening for changes to `self`. The event listener
@@ -49,7 +55,7 @@ pub struct EventListener<'a> {
     /// The event in question.
     event: &'a Event,
     /// The version number of the event when this listener was created.
-    version: u32,
+    version: u64,
 }
 
 impl<'a> EventListener<'a> {
@@ -82,9 +88,11 @@ impl<'a> EventListener<'a> {
     /// Blocks the current thread. Returns when [`Event::notify`] has been
     /// called at least once since this object's creation.
     pub fn wait(&self) {
+        self.event.waiting_listeners.fetch_add(1, Ordering::Release);
         while !self.signaled() {
-            atomic_wait::wait(&self.event.version, self.version);
+            self.event.version.wait(self.version);
         }
+        self.event.waiting_listeners.fetch_sub(1, Ordering::Release);
     }
 }
 
