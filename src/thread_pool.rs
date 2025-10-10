@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::hint::unreachable_unchecked;
@@ -17,15 +18,9 @@ use crate::{Task, TaskInner};
 /// The global thread pool.
 static GLOBAL_POOL: spin::Once<ThreadPool> = spin::Once::new();
 
-#[cfg(nightly)]
-#[thread_local]
-/// The thread pool that is locally active due to [`ThreadPool::install`].
-static LOCAL_POOL: UnsafeCell<*const ThreadPool> = const { UnsafeCell::new(std::ptr::null()) };
-
-#[cfg(not(nightly))]
 thread_local! {
     /// The thread pool that is locally active due to [`ThreadPool::install`].
-    static LOCAL_POOL: UnsafeCell<*const ThreadPool> = const { UnsafeCell::new(std::ptr::null()) };
+    static LOCAL_POOL: Cell<*const ThreadPool> = const { Cell::new(std::ptr::null()) };
 }
 
 /// The function signature for the [`ThreadPoolBuilder::spawn_handler`]
@@ -150,34 +145,18 @@ impl ThreadPool {
     /// Panics if called from within a parallel iterator or other asynchronous
     /// task.
     pub fn install<R>(&self, f: impl FnOnce() -> R) -> R {
-        unsafe {
-            assert!(
-                JoinPoint::current().is_none(),
-                "Attempted to enter pool from within another context."
-            );
+        assert!(
+            JoinPoint::current().is_none(),
+            "Attempted to enter pool from within another context."
+        );
 
-            #[cfg(nightly)]
-            {
-                let _guard =
-                    PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
-                let previous = *LOCAL_POOL.get();
-                *LOCAL_POOL.get() = self;
-                let result = f();
-                *LOCAL_POOL.get() = previous;
-                result
-            }
-
-            #[cfg(not(nightly))]
-            LOCAL_POOL.with(|x| {
-                let _guard =
-                    PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
-                let previous = *x.get();
-                *x.get() = self;
-                let result = f();
-                *x.get() = previous;
-                result
-            })
-        }
+        let _guard =
+            PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
+        let previous = LOCAL_POOL.get();
+        LOCAL_POOL.set(self);
+        let result = f();
+        LOCAL_POOL.set(previous);
+        result
     }
 
     /// Spawns an asynchronous task on the global thread pool.
@@ -190,29 +169,14 @@ impl ThreadPool {
     /// Initializes the global thread pool if no other pool is active.
     pub(crate) fn with_current<R>(f: impl FnOnce(&ThreadPool) -> R) -> R {
         unsafe {
-            #[cfg(nightly)]
-            {
-                let value = &mut *LOCAL_POOL.get();
+            let mut pool_ptr = LOCAL_POOL.get();
 
-                if value.is_null() {
-                    *value = GLOBAL_POOL.call_once(|| ThreadPoolBuilder::default().build());
-                }
-
-                let pool_ptr = *value;
-                f(&*pool_ptr)
+            if pool_ptr.is_null() {
+                pool_ptr = GLOBAL_POOL.call_once(|| ThreadPoolBuilder::default().build());
+                LOCAL_POOL.set(pool_ptr);
             }
 
-            #[cfg(not(nightly))]
-            LOCAL_POOL.with(|x| {
-                let value = &mut *x.get();
-
-                if value.is_null() {
-                    *value = GLOBAL_POOL.call_once(|| ThreadPoolBuilder::default().build());
-                }
-
-                let pool_ptr = *value;
-                f(&*pool_ptr)
-            })
+            f(&*pool_ptr)
         }
     }
 
@@ -498,6 +462,7 @@ impl ThreadPoolState {
     /// Schedules a task to be run on the pool.
     pub fn push_task(&self, task: Arc<dyn TaskInner>) {
         self.tasks.lock().push_back(task);
+        self.on_change.notify();
     }
 
     /// Polls for available work on the thread pool, and goes to sleep if none

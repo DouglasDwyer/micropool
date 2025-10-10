@@ -1,6 +1,5 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
-#![cfg_attr(nightly, feature(thread_local))]
 
 pub use paralight::iter;
 use paralight::iter::GenericThreadPool;

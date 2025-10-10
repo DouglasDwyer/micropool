@@ -6,11 +6,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/DouglasDwyer/micropool"
 readme = "README.md"
 description = """
-Low-latency thread pool for paralight
+Low-latency thread pool with parallel iterators
 """
-
-[build-dependencies]
-rustversion = { version = "1.0.14", default-features = false }
 
 [dependencies]
 paralight = { git = "https://github.com/DouglasDwyer/paralight", rev = "03cd90f9e3b056aad3f8e8a738c3735e22d94ffa", default-features = false, features = [ "nightly" ] }

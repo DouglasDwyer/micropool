@@ -1,4 +1,4 @@
-use std::cell::UnsafeCell;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use smallvec::SmallVec;
@@ -7,15 +7,9 @@ use crate::thread_pool::ThreadPoolState;
 use crate::util::*;
 use crate::{TaskInner, TaskState};
 
-/// The last join point entered by this thread, if any.
-#[cfg(nightly)]
-#[thread_local]
-static CURRENT_JOIN_POINT: UnsafeCell<Option<JoinPoint>> = const { UnsafeCell::new(None) };
-
-#[cfg(not(nightly))]
 thread_local! {
     /// The last join point entered by this thread, if any.
-    static CURRENT_JOIN_POINT: UnsafeCell<Option<JoinPoint>> = const { UnsafeCell::new(None) };
+    static CURRENT_JOIN_POINT: Cell<Option<JoinPoint>> = const { Cell::new(None) };
 }
 
 /// References a point in the call stack where control flow was split across
@@ -152,26 +146,14 @@ impl JoinPoint {
 
     /// Gets the join point associated with the current context, if any.
     pub fn current() -> Option<JoinPoint> {
-        #[cfg(nightly)]
-        unsafe {
-            (*CURRENT_JOIN_POINT.get()).clone()
-        }
-        #[cfg(not(nightly))]
-        unsafe {
-            CURRENT_JOIN_POINT.with(|x| (*x.get()).clone())
-        }
+        let result = CURRENT_JOIN_POINT.take();
+        CURRENT_JOIN_POINT.set(result.clone());
+        result
     }
 
     /// Sets the join point associated with the current context, if any.
     pub fn set_current(point: Option<JoinPoint>) {
-        #[cfg(nightly)]
-        unsafe {
-            *CURRENT_JOIN_POINT.get() = point
-        }
-        #[cfg(not(nightly))]
-        unsafe {
-            CURRENT_JOIN_POINT.with(|x| *x.get() = point)
-        }
+        CURRENT_JOIN_POINT.set(point);
     }
 
     /// Processes work unit `i`, and wakes up any waiting threads if work is
