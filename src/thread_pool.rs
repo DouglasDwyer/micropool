@@ -1,5 +1,4 @@
-use std::cell::Cell;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::hint::unreachable_unchecked;
 use std::mem::MaybeUninit;
@@ -150,8 +149,7 @@ impl ThreadPool {
             "Attempted to enter pool from within another context."
         );
 
-        let _guard =
-            PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
+        let _guard = PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
         let previous = LOCAL_POOL.get();
         LOCAL_POOL.set(self);
         let result = f();
@@ -274,7 +272,7 @@ impl Drop for ThreadPool {
 /// Implementation for [`ThreadPool::split_per_item`].
 struct SplitPerItem<'a>(&'a ThreadPool);
 
-impl<'a> GenericThreadPool for SplitPerItem<'a> {
+unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
     fn upper_bounded_pipeline<Output: Send, Accum>(
         self,
         input_len: usize,
@@ -344,7 +342,7 @@ struct SplitPer<'a, F: Fn(usize) -> (usize, usize)> {
     pool: &'a ThreadPool,
 }
 
-impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'a, F> {
+unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'a, F> {
     fn upper_bounded_pipeline<Output: Send, Accum>(
         self,
         input_len: usize,

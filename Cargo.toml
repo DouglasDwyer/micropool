@@ -10,7 +10,7 @@ Low-latency thread pool with parallel iterators
 """
 
 [dependencies]
-paralight = { git = "https://github.com/DouglasDwyer/paralight", rev = "03cd90f9e3b056aad3f8e8a738c3735e22d94ffa", default-features = false, features = [ "nightly" ] }
+paralight = { git = "https://github.com/DouglasDwyer/paralight", rev = "cd164c3db9227a96316d0ade60fd636d4fceb437" }
 smallvec = { version = "1.15.1", default-features = false }
 spin = { version = "0.10.0", default-features = false, features = [ "once", "rwlock", "spin_mutex" ] }
 wait_on_address = { version = "0.1.0", default-features = false }

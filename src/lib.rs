@@ -29,7 +29,7 @@ mod util;
 pub fn split_per_item() -> impl GenericThreadPool {
     struct SplitPerItem;
 
-    impl GenericThreadPool for SplitPerItem {
+    unsafe impl GenericThreadPool for SplitPerItem {
         fn upper_bounded_pipeline<Output: Send, Accum>(
             self,
             input_len: usize,
@@ -73,7 +73,7 @@ pub fn split_per_item() -> impl GenericThreadPool {
 pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
     struct ThreadPerChunk(usize);
 
-    impl GenericThreadPool for ThreadPerChunk {
+    unsafe impl GenericThreadPool for ThreadPerChunk {
         fn upper_bounded_pipeline<Output: Send, Accum>(
             self,
             input_len: usize,
@@ -118,7 +118,7 @@ pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
 pub fn split_by(chunks: usize) -> impl GenericThreadPool {
     struct Chunks(usize);
 
-    impl GenericThreadPool for Chunks {
+    unsafe impl GenericThreadPool for Chunks {
         fn upper_bounded_pipeline<Output: Send, Accum>(
             self,
             input_len: usize,
@@ -164,7 +164,7 @@ pub fn split_by(chunks: usize) -> impl GenericThreadPool {
 pub fn split_by_threads() -> impl GenericThreadPool {
     struct SplitByThreads;
 
-    impl GenericThreadPool for SplitByThreads {
+    unsafe impl GenericThreadPool for SplitByThreads {
         fn upper_bounded_pipeline<Output: Send, Accum>(
             self,
             input_len: usize,

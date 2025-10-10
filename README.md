@@ -1,4 +1,4 @@
-# 🌊 micropool: low-latency thread pool with parallel iterator support
+# 🌊 micropool: low-latency thread pool with parallel iterators
 
 [![Crates.io](https://img.shields.io/crates/v/micropool.svg)](https://crates.io/crates/micropool)
 [![Docs.rs](https://docs.rs/micropool/badge.svg)](https://docs.rs/micropool)

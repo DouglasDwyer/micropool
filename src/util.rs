@@ -19,7 +19,7 @@ pub struct Event {
     /// The version number - incremented each time the event changes.
     version: AtomicU64,
     /// The number of listeners that have begun sleeping.
-    waiting_listeners: AtomicU32
+    waiting_listeners: AtomicU32,
 }
 
 impl Event {
@@ -27,7 +27,7 @@ impl Event {
     pub const fn new() -> Self {
         Self {
             version: AtomicU64::new(0),
-            waiting_listeners: AtomicU32::new(0)
+            waiting_listeners: AtomicU32::new(0),
         }
     }
 
