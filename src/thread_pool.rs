@@ -159,7 +159,7 @@ impl ThreadPool {
 
     /// Spawns an asynchronous task on the global thread pool.
     /// The returned handle can be used to obtain the result.
-    pub fn spawn<T: 'static>(&self, f: impl 'static + FnOnce() -> T + Send) -> Task<T> {
+    pub fn spawn<T: 'static + Send>(&self, f: impl 'static + FnOnce() -> T + Send) -> Task<T> {
         Task::spawn(self.state, f)
     }
 

@@ -4,9 +4,9 @@ use crate::ThreadPoolState;
 use crate::join_point::JoinPoint;
 
 /// A handle to a queued group of work units, which output a single result.
-pub struct Task<T: 'static>(Arc<dyn TypedTaskInner<T>>);
+pub struct Task<T: 'static + Send>(Arc<dyn TypedTaskInner<T>>);
 
-impl<T: 'static> Task<T> {
+impl<T: 'static + Send> Task<T> {
     /// Spawns a new task on the given pool.
     pub(crate) fn spawn(
         pool: &'static ThreadPoolState,
@@ -60,7 +60,7 @@ impl<T: 'static> Task<T> {
 }
 
 /// Allows for thread pools to manipulate the inner task state.
-pub(crate) trait TaskInner {
+pub(crate) trait TaskInner: Send {
     /// The thread pool on which this work is spawned.
     fn pool(&self) -> &'static ThreadPoolState;
 
@@ -72,7 +72,7 @@ pub(crate) trait TaskInner {
     fn run(&self);
 }
 
-trait TypedTaskInner<T>: TaskInner {
+trait TypedTaskInner<T: Send>: TaskInner + Send + Sync {
     /// Whether the task has finished execution.
     fn complete(&self) -> bool;
 
@@ -81,7 +81,7 @@ trait TypedTaskInner<T>: TaskInner {
     fn take_result(&self) -> T;
 }
 
-struct TaskInnerHolder<T, F: FnOnce() -> T + Send> {
+struct TaskInnerHolder<T: Send, F: FnOnce() -> T + Send> {
     /// The function to invoke.
     func: spin::Mutex<Option<F>>,
     /// The thread pool on which this work is spawned.
@@ -92,7 +92,7 @@ struct TaskInnerHolder<T, F: FnOnce() -> T + Send> {
     state: spin::RwLock<TaskState>,
 }
 
-impl<T, F: FnOnce() -> T + Send> TaskInner for TaskInnerHolder<T, F> {
+impl<T: Send, F: FnOnce() -> T + Send> TaskInner for TaskInnerHolder<T, F> {
     fn pool(&self) -> &'static ThreadPoolState {
         self.pool
     }
@@ -111,7 +111,7 @@ impl<T, F: FnOnce() -> T + Send> TaskInner for TaskInnerHolder<T, F> {
     }
 }
 
-impl<T, F: FnOnce() -> T + Send> TypedTaskInner<T> for TaskInnerHolder<T, F> {
+impl<T: Send, F: FnOnce() -> T + Send> TypedTaskInner<T> for TaskInnerHolder<T, F> {
     fn complete(&self) -> bool {
         self.result.lock().is_some()
     }
