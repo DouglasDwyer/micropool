@@ -215,6 +215,11 @@ where
     ThreadPool::with_current(|pool| pool.join(oper_a, oper_b))
 }
 
+/// The total number of worker threads in the current pool.
+pub fn num_threads() -> usize {
+    ThreadPool::with_current(|pool| pool.num_threads())
+}
+
 /// Spawns an asynchronous task on the global thread pool.
 /// The returned handle can be used to obtain the result.
 pub fn spawn<T: 'static + Send>(f: impl 'static + Send + FnOnce() -> T) -> Task<T> {
