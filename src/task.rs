@@ -34,14 +34,11 @@ impl<T: 'static + Send> Task<T> {
         self.0.complete()
     }
 
-    /// Attempts to get the result of this task if it has been completed.
-    /// Otherwise, returns the original task.
-    pub fn result(self) -> Result<T, Self> {
-        if self.complete() {
-            Ok(self.join())
-        } else {
-            Err(self)
-        }
+    /// Steals any outstanding work on this task.
+    /// Returns immediately if there are remaining units in progress on other
+    /// threads.
+    pub fn help(&self) {
+        JoinPoint::join_task(&*self.0, true);
     }
 
     /// Joins the current thread with this task, completing all remaining work.
@@ -51,11 +48,14 @@ impl<T: 'static + Send> Task<T> {
         self.0.take_result()
     }
 
-    /// Joins with the remaining work on this task.
-    /// Returns immediately if there are outstanding units in progress on other
-    /// threads.
-    pub fn join_work(&self) {
-        JoinPoint::join_task(&*self.0, true);
+    /// Attempts to get the result of this task if it has been completed.
+    /// Otherwise, returns the original task.
+    pub fn result(self) -> Result<T, Self> {
+        if self.complete() {
+            Ok(self.join())
+        } else {
+            Err(self)
+        }
     }
 }
 

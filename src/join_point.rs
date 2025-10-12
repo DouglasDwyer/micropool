@@ -91,9 +91,9 @@ impl JoinPoint {
     /// Begins running `task`. If the task was already started on another
     /// thread, then joins with that task.
     ///
-    /// If `join_work_only` is true, then this function may return early
+    /// If `help_only` is true, then this function may return early
     /// (before the task is complete) while other threads finish their work.
-    pub fn join_task(task: &dyn TaskInner, join_work_only: bool) {
+    pub fn join_task(task: &dyn TaskInner, help_only: bool) {
         unsafe {
             let mut state_lock = task.state().write();
 
@@ -133,8 +133,8 @@ impl JoinPoint {
                 }
                 TaskState::Running(join_point) => {
                     drop(state_lock);
-                    if join_work_only {
-                        join_point.join_work();
+                    if help_only {
+                        join_point.help();
                     } else {
                         join_point.join();
                     }
@@ -220,7 +220,7 @@ impl JoinPoint {
             unsafe {
                 Self::invoke_work_unit(&child, i);
             }
-            Self::join_work(&child);
+            Self::help(&child);
             true
         } else {
             false
@@ -240,7 +240,7 @@ impl JoinPoint {
     /// Finishes once all available work has been **started**, but not
     /// necessarily finished. Returns `true` if at least one available work
     /// unit was run to completion.
-    pub fn join_work(&self) -> bool {
+    pub fn help(&self) -> bool {
         let invoked_immediate = self.invoke_immediate_work();
         let invoked_children = self.invoke_child_work();
         invoked_immediate || invoked_children

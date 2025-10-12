@@ -483,7 +483,7 @@ impl ThreadPoolState {
                 unsafe {
                     point.invoke_work_unit(i);
                 }
-                point.join_work();
+                point.help();
                 JoinPoint::set_current(None);
             } else if self.should_stop.load(Ordering::Acquire) {
                 return;
