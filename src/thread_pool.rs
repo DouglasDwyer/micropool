@@ -53,7 +53,7 @@ impl ThreadPoolBuilder {
         let mut run = false;
         GLOBAL_POOL.call_once(|| {
             run = true;
-            ThreadPoolBuilder::default().build()
+            self.build()
         });
 
         if !run {
