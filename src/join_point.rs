@@ -49,11 +49,16 @@ impl JoinPoint {
                         );
                     }
 
+                    let f = std::mem::transmute::<
+                        *const (dyn Fn(usize) + '_),
+                        *const (dyn Fn(usize) + 'static),
+                    >(&f as *const dyn Fn(usize));
+
                     ScopedRef::of(
                         JoinPointInner {
                             children: spin::RwLock::new(SmallVec::new()),
                             completed_invocations: AtomicU64::new(0),
-                            func: &f as *const _ as *const _,
+                            func: f,
                             on_change: parent
                                 .as_ref()
                                 .map(|x| x.0.on_change)
@@ -102,12 +107,16 @@ impl JoinPoint {
                     let previous = Self::current();
                     let on_change = Event::new();
                     let f = |_| task.run();
+                    let f = std::mem::transmute::<
+                        *const (dyn Fn(usize) + '_),
+                        *const (dyn Fn(usize) + 'static),
+                    >(&f as *const _);
 
                     ScopedRef::of(
                         JoinPointInner {
                             children: spin::RwLock::new(SmallVec::new()),
                             completed_invocations: AtomicU64::new(0),
-                            func: &f as *const _ as *const _,
+                            func: f,
                             on_change: &on_change,
                             parent: None,
                             pool: task.pool(),
