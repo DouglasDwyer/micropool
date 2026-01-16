@@ -65,6 +65,14 @@ impl<T: 'static + Send> OwnedTask<T> {
     }
 }
 
+impl<T: 'static + Send> std::fmt::Debug for OwnedTask<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedTask")
+            .field("complete", &self.complete())
+            .finish_non_exhaustive()
+    }
+}
+
 /// A clonable task whose result can be shared by reference.
 pub struct SharedTask<T: 'static + Send + Sync>(Arc<dyn TypedTaskInner<T>>);
 
@@ -139,6 +147,14 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
 impl<T: 'static + Send + Sync> Clone for SharedTask<T> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+impl<T: 'static + Send + Sync> std::fmt::Debug for SharedTask<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedTask")
+            .field("complete", &self.complete())
+            .finish_non_exhaustive()
     }
 }
 
