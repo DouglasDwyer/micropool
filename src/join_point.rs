@@ -174,9 +174,7 @@ impl JoinPoint {
     /// `0..self.0.total_invocations`. Any other calls are undefined
     /// behavior.
     pub unsafe fn invoke_work_unit(&self, i: u64) {
-        unsafe {
-            let _guard = PanicGuard("Panic was not caught at join point boundary; aborting.");
-
+        abort_on_panic(|| unsafe {
             debug_assert!(
                 i < self.0.total_invocations,
                 "Invoked out-of-bounds work unit"
@@ -198,7 +196,7 @@ impl JoinPoint {
 
                 (*self.0.on_change).notify();
             }
-        }
+        })
     }
 
     /// Exhausts all work for this join point (but not any of its children).

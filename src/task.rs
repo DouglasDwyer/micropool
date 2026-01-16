@@ -5,13 +5,10 @@ use takecell::TakeOwnCell;
 use crate::ThreadPoolState;
 use crate::join_point::JoinPoint;
 
-/// A handle to some background work.
-///
-/// Unlike [`SharedTask`], this type cannot be cloned. However,
-/// it returns a `T` rather than `&T` as its result.
-pub struct Task<T: 'static + Send>(Arc<dyn TypedTaskInner<TakeOwnCell<T>>>);
+/// A task whose result is exclusively owned by the caller.
+pub struct OwnedTask<T: 'static + Send>(Arc<dyn TypedTaskInner<TakeOwnCell<T>>>);
 
-impl<T: 'static + Send> Task<T> {
+impl<T: 'static + Send> OwnedTask<T> {
     /// Spawns a new task on the given pool.
     pub(crate) fn spawn(
         pool: &'static ThreadPoolState,
@@ -68,10 +65,7 @@ impl<T: 'static + Send> Task<T> {
     }
 }
 
-/// A handle to some background work.
-///
-/// Unlike [`Task`], this type can be cloned. It returns a
-/// `&T` rather than a `T` as its result.
+/// A clonable task whose result can be shared by reference.
 pub struct SharedTask<T: 'static + Send + Sync>(Arc<dyn TypedTaskInner<T>>);
 
 impl<T: 'static + Send + Sync> SharedTask<T> {
@@ -124,7 +118,7 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
     /// Joins the current thread with this task, completing all remaining work.
     /// After all work is complete, yields the result.
     pub fn join(&self) -> &T {
-        if self.0.result().is_none() {
+        if !self.0.complete() {
             JoinPoint::join_task(&*self.0, false);
         }
 

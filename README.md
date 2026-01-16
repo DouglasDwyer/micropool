@@ -54,7 +54,7 @@ The `.with_thread_pool` line specifies that the current `micropool` instance sho
 Tasks can be spawned asynchronously, then `join`ed later:
 
 ```rust
-let task = micropool::spawn(|| 2 + 2);
+let task = micropool::spawn_owned(|| 2 + 2);
 println!("Is my task complete yet? {}", task.complete());
 println!("The result: {}", task.join());
 
@@ -69,7 +69,7 @@ The following example illustrates the properties of the `micropool` scheduling s
 
 ```rust
 println!("A {:?}", std::thread::current().id());
-let background_task = micropool::spawn(|| println!("B {:?}", std::thread::current().id()));
+let background_task = micropool::spawn_owned(|| println!("B {:?}", std::thread::current().id()));
 
 micropool::join(|| {
     std::thread::sleep(std::time::Duration::from_millis(20));

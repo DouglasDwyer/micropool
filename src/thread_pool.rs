@@ -12,7 +12,7 @@ use smallvec::SmallVec;
 
 use crate::join_point::*;
 use crate::util::*;
-use crate::{SharedTask, Task, TaskInner};
+use crate::{OwnedTask, SharedTask, TaskInner};
 
 /// The global thread pool.
 static GLOBAL_POOL: spin::Once<ThreadPool> = spin::Once::new();
@@ -144,23 +144,27 @@ impl ThreadPool {
     /// Panics if called from within a parallel iterator or other asynchronous
     /// task.
     pub fn install<R>(&self, f: impl FnOnce() -> R) -> R {
-        assert!(
-            JoinPoint::current().is_none(),
-            "Attempted to enter pool from within another context."
-        );
+        abort_on_panic(|| {
+            assert!(
+                JoinPoint::current().is_none(),
+                "Attempted to enter pool from within another context."
+            );
 
-        let _guard = PanicGuard("Panic was not caught at ThreadPool install boundary; aborting.");
-        let previous = LOCAL_POOL.get();
-        LOCAL_POOL.set(self);
-        let result = f();
-        LOCAL_POOL.set(previous);
-        result
+            let previous = LOCAL_POOL.get();
+            LOCAL_POOL.set(self);
+            let result = f();
+            LOCAL_POOL.set(previous);
+            result
+        })
     }
 
     /// Spawns an asynchronous task on the global thread pool.
     /// The returned handle can be used to obtain the result.
-    pub fn spawn<T: 'static + Send>(&self, f: impl 'static + FnOnce() -> T + Send) -> Task<T> {
-        Task::spawn(self.state, f)
+    pub fn spawn_owned<T: 'static + Send>(
+        &self,
+        f: impl 'static + FnOnce() -> T + Send,
+    ) -> OwnedTask<T> {
+        OwnedTask::spawn(self.state, f)
     }
 
     /// Spawns a shared asynchronous task on the global thread pool.
@@ -263,7 +267,9 @@ impl ThreadPool {
     /// Every iterator will be broken up into [`Self::num_threads`]
     /// separate work units, which may be processed in parallel.
     pub fn split_by_threads(&self) -> impl '_ + GenericThreadPool {
-        self.split_by(self.num_threads())
+        // Add one additional chunk for cases where a non-pool
+        // thread is invoking the work
+        self.split_by(self.num_threads() + 1)
     }
 }
 

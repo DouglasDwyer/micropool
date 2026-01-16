@@ -223,13 +223,13 @@ pub fn num_threads() -> usize {
     ThreadPool::with_current(|pool| pool.num_threads())
 }
 
-/// Spawns an asynchronous task on the global thread pool.
+/// Spawns an asynchronous task on the current thread pool.
 /// The returned handle can be used to obtain the result.
-pub fn spawn<T: 'static + Send>(f: impl 'static + Send + FnOnce() -> T) -> Task<T> {
-    ThreadPool::with_current(|pool| pool.spawn(f))
+pub fn spawn_owned<T: 'static + Send>(f: impl 'static + Send + FnOnce() -> T) -> OwnedTask<T> {
+    ThreadPool::with_current(|pool| pool.spawn_owned(f))
 }
 
-/// Spawns a shared asynchronous task on the global thread pool.
+/// Spawns a shared asynchronous task on the current thread pool.
 /// The returned handle can be used to obtain the result.
 pub fn spawn_shared<T: 'static + Send + Sync>(
     f: impl 'static + Send + FnOnce() -> T,
@@ -294,13 +294,15 @@ mod tests {
     /// Spawns and joins many tasks.
     #[test]
     fn execute_many() {
-        let first_task = crate::spawn(|| 2);
-        let second_task = crate::spawn(|| 2);
+        let first_task = crate::spawn_owned(|| 2);
+        let second_task = crate::spawn_owned(|| 2);
         assert_eq!(first_task.join(), second_task.join());
 
         for _ in 0..1000 {
-            let third_task = crate::spawn(|| std::thread::sleep(std::time::Duration::new(0, 10)));
-            let fourth_task = crate::spawn(|| std::thread::sleep(std::time::Duration::new(0, 200)));
+            let third_task =
+                crate::spawn_owned(|| std::thread::sleep(std::time::Duration::new(0, 10)));
+            let fourth_task =
+                crate::spawn_owned(|| std::thread::sleep(std::time::Duration::new(0, 200)));
             assert_eq!(third_task.join(), fourth_task.join());
         }
     }

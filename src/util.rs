@@ -96,17 +96,23 @@ impl<'a> EventListener<'a> {
     }
 }
 
-/// Ensures that the program aborts on any unhandled panic where this object is
-/// in scope. The provided message will be printed.
-pub struct PanicGuard(pub &'static str);
+/// Invokes the closure `f`. If `f` panics and unwinding reaches this stack
+/// frame, then aborts the process.
+pub fn abort_on_panic<R, F: FnOnce() -> R>(f: F) -> R {
+    /// Ensures that the program aborts on any unhandled panic where this object
+    /// is in scope. The provided message will be printed.
+    struct PanicGuard;
 
-impl Drop for PanicGuard {
-    fn drop(&mut self) {
-        if thread::panicking() {
-            // Panicking within another panic causes termination.
-            panic!("{}", self.0);
+    impl Drop for PanicGuard {
+        fn drop(&mut self) {
+            if thread::panicking() {
+                std::process::abort();
+            }
         }
     }
+
+    let _guard = PanicGuard;
+    f()
 }
 
 /// Allows for erasing lifetimes and sharing references on the stack.
