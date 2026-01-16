@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle, available_parallelism};
 
-use paralight::iter::GenericThreadPool;
+use paralight::iter::{Accumulator, ExactSizeAccumulator, GenericThreadPool, SourceCleanup};
 use smallvec::SmallVec;
 
 use crate::join_point::*;
@@ -277,10 +277,10 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
         self,
         input_len: usize,
         init: impl Fn() -> Accum + Sync,
-        process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+        process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
         finalize: impl Fn(Accum) -> Output + Sync,
         reduce: impl Fn(Output, Output) -> Output,
-        _: &(impl paralight::iter::SourceCleanup + Sync),
+        _: &(impl SourceCleanup + Sync)
     ) -> Output {
         unsafe {
             let mut output = SmallVec::<[Output; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
@@ -307,15 +307,15 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
         }
     }
 
-    fn iter_pipeline<Output: Send>(
+    fn iter_pipeline<Output, Accum: Send>(
         self,
         input_len: usize,
-        accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
-        reduce: impl paralight::iter::Accumulator<Output, Output>,
-        _: &(impl paralight::iter::SourceCleanup + Sync),
+        accum: impl Accumulator<usize, Accum> + Sync,
+        reduce: impl ExactSizeAccumulator<Accum, Output>,
+        _: &(impl SourceCleanup + Sync)
     ) -> Output {
         unsafe {
-            let mut output = SmallVec::<[Output; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
+            let mut output = SmallVec::<[Accum; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
             output.reserve_exact(input_len);
             let output_buffer = output.as_mut_ptr();
 
@@ -328,7 +328,7 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
             );
 
             output.set_len(input_len);
-            reduce.accumulate(output.into_iter())
+            reduce.accumulate_exact(output.into_iter())
         }
     }
 }
@@ -347,10 +347,10 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
         self,
         input_len: usize,
         init: impl Fn() -> Accum + Sync,
-        process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+        process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
         finalize: impl Fn(Accum) -> Output + Sync,
         reduce: impl Fn(Output, Output) -> Output,
-        _: &(impl paralight::iter::SourceCleanup + Sync),
+        _: &(impl SourceCleanup + Sync)
     ) -> Output {
         unsafe {
             let (chunk_size, work_units) = (self.chunk_units_calculator)(input_len);
@@ -386,17 +386,17 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
         }
     }
 
-    fn iter_pipeline<Output: Send>(
+    fn iter_pipeline<Output, Accum: Send>(
         self,
         input_len: usize,
-        accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
-        reduce: impl paralight::iter::Accumulator<Output, Output>,
-        _: &(impl paralight::iter::SourceCleanup + Sync),
+        accum: impl Accumulator<usize, Accum> + Sync,
+        reduce: impl ExactSizeAccumulator<Accum, Output>,
+        _: &(impl SourceCleanup + Sync)
     ) -> Output {
         unsafe {
             let (chunk_size, work_units) = (self.chunk_units_calculator)(input_len);
 
-            let mut output = SmallVec::<[Output; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
+            let mut output = SmallVec::<[Accum; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
             output.reserve_exact(work_units);
             let output_buffer = output.as_mut_ptr();
 
@@ -411,7 +411,7 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
             );
 
             output.set_len(work_units);
-            reduce.accumulate(output.into_iter())
+            reduce.accumulate_exact(output.into_iter())
         }
     }
 }

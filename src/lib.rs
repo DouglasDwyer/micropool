@@ -1,8 +1,13 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
+use std::ops::ControlFlow;
+
 pub use paralight::iter;
+use paralight::iter::Accumulator;
+use paralight::iter::ExactSizeAccumulator;
 use paralight::iter::GenericThreadPool;
+use paralight::iter::SourceCleanup;
 
 pub use self::task::*;
 pub use self::thread_pool::*;
@@ -34,10 +39,10 @@ pub fn split_per_item() -> impl GenericThreadPool {
             self,
             input_len: usize,
             init: impl Fn() -> Accum + Sync,
-            process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+            process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
             finalize: impl Fn(Accum) -> Output + Sync,
             reduce: impl Fn(Output, Output) -> Output,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+            cleanup: &(impl SourceCleanup + Sync)
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_per_item().upper_bounded_pipeline(
@@ -51,12 +56,12 @@ pub fn split_per_item() -> impl GenericThreadPool {
             })
         }
 
-        fn iter_pipeline<Output: Send>(
+        fn iter_pipeline<Output, Accum: Send>(
             self,
             input_len: usize,
-            accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
-            reduce: impl paralight::iter::Accumulator<Output, Output>,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+            accum: impl Accumulator<usize, Accum> + Sync,
+            reduce: impl ExactSizeAccumulator<Accum, Output>,
+            cleanup: &(impl SourceCleanup + Sync)
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_per_item()
@@ -78,10 +83,10 @@ pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
             self,
             input_len: usize,
             init: impl Fn() -> Accum + Sync,
-            process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+            process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
             finalize: impl Fn(Accum) -> Output + Sync,
             reduce: impl Fn(Output, Output) -> Output,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+            cleanup: &(impl SourceCleanup + Sync)
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by(self.0).upper_bounded_pipeline(
@@ -95,12 +100,12 @@ pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
             })
         }
 
-        fn iter_pipeline<Output: Send>(
+        fn iter_pipeline<Output, Accum: Send>(
             self,
             input_len: usize,
-            accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
-            reduce: impl paralight::iter::Accumulator<Output, Output>,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+            accum: impl Accumulator<usize, Accum> + Sync,
+            reduce: impl ExactSizeAccumulator<Accum, Output>,
+            cleanup: &(impl SourceCleanup + Sync)
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by(self.0)
@@ -123,10 +128,10 @@ pub fn split_by(chunks: usize) -> impl GenericThreadPool {
             self,
             input_len: usize,
             init: impl Fn() -> Accum + Sync,
-            process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+            process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
             finalize: impl Fn(Accum) -> Output + Sync,
             reduce: impl Fn(Output, Output) -> Output,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+            cleanup: &(impl SourceCleanup + Sync)
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by(self.0).upper_bounded_pipeline(
@@ -140,12 +145,12 @@ pub fn split_by(chunks: usize) -> impl GenericThreadPool {
             })
         }
 
-        fn iter_pipeline<Output: Send>(
+        fn iter_pipeline<Output, Accum: Send>(
             self,
             input_len: usize,
-            accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
-            reduce: impl paralight::iter::Accumulator<Output, Output>,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+            accum: impl Accumulator<usize, Accum> + Sync,
+            reduce: impl ExactSizeAccumulator<Accum, Output>,
+            cleanup: &(impl SourceCleanup + Sync)
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by(self.0)
@@ -169,10 +174,10 @@ pub fn split_by_threads() -> impl GenericThreadPool {
             self,
             input_len: usize,
             init: impl Fn() -> Accum + Sync,
-            process_item: impl Fn(Accum, usize) -> std::ops::ControlFlow<Accum, Accum> + Sync,
+            process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
             finalize: impl Fn(Accum) -> Output + Sync,
             reduce: impl Fn(Output, Output) -> Output,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+            cleanup: &(impl SourceCleanup + Sync)
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by_threads().upper_bounded_pipeline(
@@ -186,12 +191,12 @@ pub fn split_by_threads() -> impl GenericThreadPool {
             })
         }
 
-        fn iter_pipeline<Output: Send>(
+        fn iter_pipeline<Output, Accum: Send>(
             self,
             input_len: usize,
-            accum: impl paralight::iter::Accumulator<usize, Output> + Sync,
-            reduce: impl paralight::iter::Accumulator<Output, Output>,
-            cleanup: &(impl paralight::iter::SourceCleanup + Sync),
+            accum: impl Accumulator<usize, Accum> + Sync,
+            reduce: impl ExactSizeAccumulator<Accum, Output>,
+            cleanup: &(impl SourceCleanup + Sync)
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by_threads()
