@@ -12,7 +12,7 @@ use smallvec::SmallVec;
 
 use crate::join_point::*;
 use crate::util::*;
-use crate::{Task, TaskInner};
+use crate::{SharedTask, Task, TaskInner};
 
 /// The global thread pool.
 static GLOBAL_POOL: spin::Once<ThreadPool> = spin::Once::new();
@@ -163,6 +163,15 @@ impl ThreadPool {
         Task::spawn(self.state, f)
     }
 
+    /// Spawns a shared asynchronous task on the global thread pool.
+    /// The returned handle can be used to obtain the result.
+    pub fn spawn_shared<T: 'static + Send + Sync>(
+        &self,
+        f: impl 'static + FnOnce() -> T + Send,
+    ) -> SharedTask<T> {
+        SharedTask::spawn(self.state, f)
+    }
+
     /// Executes `f` within the context of the current thread pool.
     /// Initializes the global thread pool if no other pool is active.
     pub(crate) fn with_current<R>(f: impl FnOnce(&ThreadPool) -> R) -> R {
@@ -280,7 +289,7 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
         process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
         finalize: impl Fn(Accum) -> Output + Sync,
         reduce: impl Fn(Output, Output) -> Output,
-        _: &(impl SourceCleanup + Sync)
+        _: &(impl SourceCleanup + Sync),
     ) -> Output {
         unsafe {
             let mut output = SmallVec::<[Output; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
@@ -312,7 +321,7 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
         input_len: usize,
         accum: impl Accumulator<usize, Accum> + Sync,
         reduce: impl ExactSizeAccumulator<Accum, Output>,
-        _: &(impl SourceCleanup + Sync)
+        _: &(impl SourceCleanup + Sync),
     ) -> Output {
         unsafe {
             let mut output = SmallVec::<[Accum; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
@@ -350,13 +359,15 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
         process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
         finalize: impl Fn(Accum) -> Output + Sync,
         reduce: impl Fn(Output, Output) -> Output,
-        _: &(impl SourceCleanup + Sync)
+        cleanup: &(impl SourceCleanup + Sync),
     ) -> Output {
         unsafe {
             let (chunk_size, work_units) = (self.chunk_units_calculator)(input_len);
 
             let mut output = SmallVec::<[Output; ThreadPool::OUTPUT_BUFFER_CAPACITY]>::new();
             output.reserve_exact(work_units);
+
+            let break_early = AtomicBool::new(false);
             let output_buffer = output.as_mut_ptr();
 
             JoinPoint::invoke(
@@ -368,8 +379,19 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
                     let mut accumulator = init();
 
                     for j in start..end {
-                        accumulator = match process_item(accumulator, j) {
-                            ControlFlow::Break(x) | ControlFlow::Continue(x) => x,
+                        if break_early.load(Ordering::Relaxed) {
+                            cleanup.cleanup_item_range(j..end);
+                            break;
+                        }
+
+                        match process_item(accumulator, j) {
+                            ControlFlow::Break(x) => {
+                                accumulator = x;
+                                break_early.store(true, Ordering::Release);
+                                cleanup.cleanup_item_range(j + 1..end);
+                                break;
+                            }
+                            ControlFlow::Continue(x) => accumulator = x,
                         };
                     }
 
@@ -391,7 +413,7 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
         input_len: usize,
         accum: impl Accumulator<usize, Accum> + Sync,
         reduce: impl ExactSizeAccumulator<Accum, Output>,
-        _: &(impl SourceCleanup + Sync)
+        _: &(impl SourceCleanup + Sync),
     ) -> Output {
         unsafe {
             let (chunk_size, work_units) = (self.chunk_units_calculator)(input_len);

@@ -9,8 +9,11 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::mem::size_of;
 
-const NUM_THREADS: &[usize] = &[1, 2, 4, 8];
-const LENGTHS: &[usize] = &[10_000, 100_000, 1_000_000, 10_000_000];
+//const NUM_THREADS: &[usize] = &[1, 2, 4, 8];
+//const LENGTHS: &[usize] = &[10_000, 100_000, 1_000_000, 10_000_000];
+
+const NUM_THREADS: &[usize] = &[6];
+const LENGTHS: &[usize] = &[1_000_000];
 
 fn sum(c: &mut Criterion) {
     let mut group = c.benchmark_group("sum");

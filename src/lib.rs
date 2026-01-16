@@ -1,13 +1,11 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
+#![warn(clippy::missing_docs_in_private_items)]
 
 use std::ops::ControlFlow;
 
 pub use paralight::iter;
-use paralight::iter::Accumulator;
-use paralight::iter::ExactSizeAccumulator;
-use paralight::iter::GenericThreadPool;
-use paralight::iter::SourceCleanup;
+use paralight::iter::{Accumulator, ExactSizeAccumulator, GenericThreadPool, SourceCleanup};
 
 pub use self::task::*;
 pub use self::thread_pool::*;
@@ -42,7 +40,7 @@ pub fn split_per_item() -> impl GenericThreadPool {
             process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
             finalize: impl Fn(Accum) -> Output + Sync,
             reduce: impl Fn(Output, Output) -> Output,
-            cleanup: &(impl SourceCleanup + Sync)
+            cleanup: &(impl SourceCleanup + Sync),
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_per_item().upper_bounded_pipeline(
@@ -61,7 +59,7 @@ pub fn split_per_item() -> impl GenericThreadPool {
             input_len: usize,
             accum: impl Accumulator<usize, Accum> + Sync,
             reduce: impl ExactSizeAccumulator<Accum, Output>,
-            cleanup: &(impl SourceCleanup + Sync)
+            cleanup: &(impl SourceCleanup + Sync),
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_per_item()
@@ -86,7 +84,7 @@ pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
             process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
             finalize: impl Fn(Accum) -> Output + Sync,
             reduce: impl Fn(Output, Output) -> Output,
-            cleanup: &(impl SourceCleanup + Sync)
+            cleanup: &(impl SourceCleanup + Sync),
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by(self.0).upper_bounded_pipeline(
@@ -105,7 +103,7 @@ pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
             input_len: usize,
             accum: impl Accumulator<usize, Accum> + Sync,
             reduce: impl ExactSizeAccumulator<Accum, Output>,
-            cleanup: &(impl SourceCleanup + Sync)
+            cleanup: &(impl SourceCleanup + Sync),
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by(self.0)
@@ -131,7 +129,7 @@ pub fn split_by(chunks: usize) -> impl GenericThreadPool {
             process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
             finalize: impl Fn(Accum) -> Output + Sync,
             reduce: impl Fn(Output, Output) -> Output,
-            cleanup: &(impl SourceCleanup + Sync)
+            cleanup: &(impl SourceCleanup + Sync),
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by(self.0).upper_bounded_pipeline(
@@ -150,7 +148,7 @@ pub fn split_by(chunks: usize) -> impl GenericThreadPool {
             input_len: usize,
             accum: impl Accumulator<usize, Accum> + Sync,
             reduce: impl ExactSizeAccumulator<Accum, Output>,
-            cleanup: &(impl SourceCleanup + Sync)
+            cleanup: &(impl SourceCleanup + Sync),
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by(self.0)
@@ -177,7 +175,7 @@ pub fn split_by_threads() -> impl GenericThreadPool {
             process_item: impl Fn(Accum, usize) -> ControlFlow<Accum, Accum> + Sync,
             finalize: impl Fn(Accum) -> Output + Sync,
             reduce: impl Fn(Output, Output) -> Output,
-            cleanup: &(impl SourceCleanup + Sync)
+            cleanup: &(impl SourceCleanup + Sync),
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by_threads().upper_bounded_pipeline(
@@ -196,7 +194,7 @@ pub fn split_by_threads() -> impl GenericThreadPool {
             input_len: usize,
             accum: impl Accumulator<usize, Accum> + Sync,
             reduce: impl ExactSizeAccumulator<Accum, Output>,
-            cleanup: &(impl SourceCleanup + Sync)
+            cleanup: &(impl SourceCleanup + Sync),
         ) -> Output {
             ThreadPool::with_current(|f| {
                 f.split_by_threads()
@@ -229,6 +227,14 @@ pub fn num_threads() -> usize {
 /// The returned handle can be used to obtain the result.
 pub fn spawn<T: 'static + Send>(f: impl 'static + Send + FnOnce() -> T) -> Task<T> {
     ThreadPool::with_current(|pool| pool.spawn(f))
+}
+
+/// Spawns a shared asynchronous task on the global thread pool.
+/// The returned handle can be used to obtain the result.
+pub fn spawn_shared<T: 'static + Send + Sync>(
+    f: impl 'static + Send + FnOnce() -> T,
+) -> SharedTask<T> {
+    ThreadPool::with_current(|pool| pool.spawn_shared(f))
 }
 
 /// Tests for `micropool`.

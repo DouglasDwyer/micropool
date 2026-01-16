@@ -13,6 +13,7 @@ Low-latency thread pool with parallel iterators
 paralight = { version = "0.0.10", default-features = false }
 smallvec = { version = "1.15.1", default-features = false }
 spin = { version = "0.10.0", default-features = false, features = [ "once", "rwlock", "spin_mutex" ] }
+takecell = { version = "0.1.1", default-features = false }
 wait_on_address = { version = "0.1.3", default-features = false }
 
 [dev-dependencies]
