@@ -6,16 +6,17 @@ use crate::ThreadPoolState;
 use crate::join_point::JoinPoint;
 
 /// A task whose result is exclusively owned by the caller.
-pub struct OwnedTask<T: 'static + Send>(Arc<dyn TypedTaskInner<TakeOwnCell<T>>>);
+pub struct OwnedTask<T: 'static + Send>(Arc<TypedTaskInner<TakeOwnCell<T>>>);
 
 impl<T: 'static + Send> OwnedTask<T> {
     /// Spawns a new task on the given pool.
+    #[inline(always)]
     pub(crate) fn spawn(
         pool: &'static ThreadPoolState,
         f: impl 'static + FnOnce() -> T + Send,
     ) -> Self {
-        let inner = Arc::new(TaskInnerHolder {
-            func: TakeOwnCell::new(|| TakeOwnCell::new(f())),
+        let inner = Arc::new(TypedTaskInner {
+            func: TakeOwnCell::new(Box::new(|| TakeOwnCell::new(f()))),
             pool,
             state: spin::RwLock::new(TaskState::NotStarted),
             result: spin::Once::new(),
@@ -27,28 +28,33 @@ impl<T: 'static + Send> OwnedTask<T> {
     }
 
     /// Cancels this task, preventing it from running if it was not yet started.
+    #[inline(always)]
     pub fn cancel(self) {
         self.0.pool().cancel_task(&self.0);
     }
 
     /// Whether the task has been completed yet.
+    #[inline(always)]
     pub fn complete(&self) -> bool {
-        self.0.complete()
+        self.0.result.is_completed()
     }
 
     /// Steals any outstanding work on this task.
     /// Returns immediately if there are remaining units in progress on other
     /// threads.
+    #[inline(always)]
     pub fn help(&self) {
         JoinPoint::join_task(&*self.0, true);
     }
 
     /// Joins the current thread with this task, completing all remaining work.
     /// After all work is complete, yields the result.
+    #[inline(always)]
     pub fn join(self) -> T {
         JoinPoint::join_task(&*self.0, false);
         self.0
-            .result()
+            .result
+            .get()
             .expect("Failed to get result of task")
             .take()
             .expect("Failed to get result of task")
@@ -56,6 +62,7 @@ impl<T: 'static + Send> OwnedTask<T> {
 
     /// Attempts to get the result of this task if it has been completed.
     /// Otherwise, returns the original task.
+    #[inline(always)]
     pub fn try_join(self) -> Result<T, Self> {
         if self.complete() {
             Ok(self.join())
@@ -74,16 +81,17 @@ impl<T: 'static + Send> std::fmt::Debug for OwnedTask<T> {
 }
 
 /// A clonable task whose result can be shared by reference.
-pub struct SharedTask<T: 'static + Send + Sync>(Arc<dyn TypedTaskInner<T>>);
+pub struct SharedTask<T: 'static + Send + Sync>(Arc<TypedTaskInner<T>>);
 
 impl<T: 'static + Send + Sync> SharedTask<T> {
     /// Spawns a new task on the given pool.
+    #[inline(always)]
     pub(crate) fn spawn(
         pool: &'static ThreadPoolState,
         f: impl 'static + FnOnce() -> T + Send,
     ) -> Self {
-        let inner = Arc::new(TaskInnerHolder {
-            func: TakeOwnCell::new(f),
+        let inner = Arc::new(TypedTaskInner {
+            func: TakeOwnCell::new(Box::new(f)),
             pool,
             state: spin::RwLock::new(TaskState::NotStarted),
             result: spin::Once::new(),
@@ -98,6 +106,7 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
     ///
     /// If this task was cloned, then [`Self::cancel`] must be called on all
     /// clones to have an effect.
+    #[inline(always)]
     pub fn cancel(self) {
         // A shared task may only be cancelled if `self` is the only reference.
         // If there are multiple references **and** the task is still enqueued,
@@ -112,29 +121,33 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
     }
 
     /// Whether the task has been completed yet.
+    #[inline(always)]
     pub fn complete(&self) -> bool {
-        self.0.complete()
+        self.0.result.is_completed()
     }
 
     /// Steals any outstanding work on this task.
     /// Returns immediately if there are remaining units in progress on other
     /// threads.
+    #[inline(always)]
     pub fn help(&self) {
         JoinPoint::join_task(&*self.0, true);
     }
 
     /// Joins the current thread with this task, completing all remaining work.
     /// After all work is complete, yields the result.
+    #[inline(always)]
     pub fn join(&self) -> &T {
-        if !self.0.complete() {
+        if !self.complete() {
             JoinPoint::join_task(&*self.0, false);
         }
 
-        self.0.result().expect("Failed to get result of task")
+        self.0.result.get().expect("Failed to get result of task")
     }
 
     /// Attempts to get the result of this task if it has been completed.
     /// Otherwise, returns the original task.
+    #[inline(always)]
     pub fn try_join(&self) -> Option<&T> {
         if self.complete() {
             Some(self.join())
@@ -160,9 +173,6 @@ impl<T: 'static + Send + Sync> std::fmt::Debug for SharedTask<T> {
 
 /// Allows for thread pools to manipulate the inner task state.
 pub(crate) trait TaskInner: Send {
-    /// Whether the task has finished execution.
-    fn complete(&self) -> bool;
-
     /// The thread pool on which this work is spawned.
     fn pool(&self) -> &'static ThreadPoolState;
 
@@ -174,17 +184,10 @@ pub(crate) trait TaskInner: Send {
     fn run(&self);
 }
 
-/// Abstracts over [`TaskInnerHolder`]s with different function types.
-trait TypedTaskInner<T: Send>: TaskInner + Send + Sync {
-    /// Gets the result of the task, or returns [`None`] if the task has not
-    /// finished.
-    fn result(&self) -> Option<&T>;
-}
-
 /// Manages the state of a task.
-struct TaskInnerHolder<T: Send + Sync, F: FnOnce() -> T + Send> {
+struct TypedTaskInner<T: Send + Sync> {
     /// The function to invoke.
-    func: TakeOwnCell<F>,
+    func: TakeOwnCell<Box<dyn FnOnce() -> T + Send>>,
     /// The thread pool on which this work is spawned.
     pool: &'static ThreadPoolState,
     /// The result of the task, if any.
@@ -193,31 +196,24 @@ struct TaskInnerHolder<T: Send + Sync, F: FnOnce() -> T + Send> {
     state: spin::RwLock<TaskState>,
 }
 
-impl<T: Send + Sync, F: FnOnce() -> T + Send> TaskInner for TaskInnerHolder<T, F> {
-    fn complete(&self) -> bool {
-        self.result.is_completed()
-    }
-
+impl<T: Send + Sync> TaskInner for TypedTaskInner<T> {
+    #[inline(always)]
     fn pool(&self) -> &'static ThreadPoolState {
         self.pool
     }
 
+    #[inline(always)]
     fn state(&self) -> &spin::RwLock<TaskState> {
         &self.state
     }
 
+    #[inline(always)]
     fn run(&self) {
         let result = self
             .func
             .take()
             .expect("TaskInner::run called multiple times")();
         self.result.call_once(|| result);
-    }
-}
-
-impl<T: Send + Sync, F: FnOnce() -> T + Send> TypedTaskInner<T> for TaskInnerHolder<T, F> {
-    fn result(&self) -> Option<&T> {
-        self.result.get()
     }
 }
 
