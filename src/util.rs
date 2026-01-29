@@ -1,7 +1,7 @@
 use std::hint::{black_box, spin_loop};
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::thread::{self};
 use wait_on_address::AtomicWait;
 
@@ -16,26 +16,38 @@ pub fn index_of<T: PartialEq>(value: &T, slice: &[T]) -> Option<usize> {
 /// it is signaled.
 #[derive(Debug, Default)]
 pub struct Event {
-    /// The version number - incremented each time the event changes.
-    version: AtomicU64,
-    /// The number of listeners that have begun sleeping.
-    waiting_listeners: AtomicU32,
+    /// The inner atomic representation of the event.
+    /// Stores the version number in the lower bits.
+    /// The uppermost bit is reserved for [`Self::WAITER_FLAG`],
+    /// which indicates whether threads are sleeping on this event.
+    atomic: AtomicU64,
 }
 
 impl Event {
+    /// When set, this bit indicates that threads are waiting
+    /// on the event counter atomic.
+    const WAITER_FLAG: u64 = 1 << 63;
+
     /// Initializes a new event.
     pub const fn new() -> Self {
         Self {
-            version: AtomicU64::new(0),
-            waiting_listeners: AtomicU32::new(0),
+            atomic: AtomicU64::new(0),
         }
     }
 
     /// Notifies all listeners that this event has changed.
     pub fn notify(&self) {
-        self.version.fetch_add(1, Ordering::Release);
-        if 0 < self.waiting_listeners.load(Ordering::Acquire) {
-            self.version.notify_all();
+        let atomic = self.atomic.fetch_add(1, Ordering::Release);
+        let new_value = atomic + 1;
+
+        if (atomic & Self::WAITER_FLAG) != 0 {
+            let _ = self.atomic.compare_exchange(
+                new_value,
+                new_value & !Event::WAITER_FLAG,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            self.atomic.notify_all();
         }
     }
 
@@ -44,7 +56,7 @@ impl Event {
     pub fn listen(&self) -> EventListener<'_> {
         EventListener {
             event: self,
-            version: self.version.load(Ordering::Acquire),
+            version: self.atomic.load(Ordering::Relaxed) & !Self::WAITER_FLAG,
         }
     }
 }
@@ -62,7 +74,15 @@ impl<'a> EventListener<'a> {
     /// Whether [`Event::notify`] has been called at least once after this
     /// object's creation.
     pub fn signaled(&self) -> bool {
-        self.event.version.load(Ordering::Acquire) != self.version
+        let atomic = self.event.atomic.load(Ordering::Relaxed);
+        if self.version == (atomic & !Event::WAITER_FLAG) {
+            false
+        } else {
+            // Since the version incremented, memory writes from signaling threads
+            // must be made visible to this thread.
+            fence(Ordering::Acquire);
+            true
+        }
     }
 
     /// Blocks the current thread, spinning in a loop for `cycles` before
@@ -88,11 +108,24 @@ impl<'a> EventListener<'a> {
     /// Blocks the current thread. Returns when [`Event::notify`] has been
     /// called at least once since this object's creation.
     pub fn wait(&self) {
-        self.event.waiting_listeners.fetch_add(1, Ordering::Release);
-        while !self.signaled() {
-            self.event.version.wait(self.version);
+        loop {
+            let (Ok(atomic) | Err(atomic)) = self.event.atomic.compare_exchange(
+                self.version,
+                self.version | Event::WAITER_FLAG,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+
+            if self.version == (atomic & !Event::WAITER_FLAG) {
+                self.event.atomic.wait(self.version | Event::WAITER_FLAG);
+            } else {
+                break;
+            }
         }
-        self.event.waiting_listeners.fetch_sub(1, Ordering::Release);
+
+        // Since the version incremented, memory writes from signaling threads
+        // must be made visible to this thread.
+        fence(Ordering::Acquire);
     }
 }
 
