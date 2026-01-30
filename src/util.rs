@@ -36,8 +36,10 @@ impl Event {
     }
 
     /// Notifies all listeners that this event has changed.
+    /// This operation guarantees a happens-before relationship between
+    /// all preceeding code and all subsequent calls to [`Self::listen`].
     pub fn notify(&self) {
-        let atomic = self.atomic.fetch_add(1, Ordering::Release);
+        let atomic = self.atomic.fetch_add(1, Ordering::SeqCst);
         let new_value = atomic + 1;
 
         if (atomic & Self::WAITER_FLAG) != 0 {
@@ -53,10 +55,12 @@ impl Event {
 
     /// Begins listening for changes to `self`. The event listener
     /// will block until [`Self::notify`] is called by another thread.
+    /// This operation guarantees a happens-before relationship between
+    /// the last call to [`Self::listen`] and all subsequent code.
     pub fn listen(&self) -> EventListener<'_> {
         EventListener {
             event: self,
-            version: self.atomic.load(Ordering::Relaxed) & !Self::WAITER_FLAG,
+            version: self.atomic.load(Ordering::SeqCst) & !Self::WAITER_FLAG,
         }
     }
 }
@@ -174,7 +178,7 @@ impl<T> ScopedRef<T> {
 impl<T> Clone for ScopedRef<T> {
     fn clone(&self) -> Self {
         unsafe {
-            self.0.as_ref().ref_count.fetch_add(1, Ordering::Release);
+            self.0.as_ref().ref_count.fetch_add(1, Ordering::Relaxed);
             Self(self.0)
         }
     }
@@ -213,8 +217,11 @@ struct ScopedHolderDropper<'a, T>(&'a ScopedHolder<T>);
 
 impl<T> Drop for ScopedHolderDropper<'_, T> {
     fn drop(&mut self) {
-        while 0 < self.0.ref_count.load(Ordering::Acquire) {
+        while 0 < self.0.ref_count.load(Ordering::Relaxed) {
             spin_loop();
         }
+
+        // Synchronize memory access with other threads before deleting the object
+        fence(Ordering::Acquire);
     }
 }

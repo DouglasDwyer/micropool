@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use smallvec::SmallVec;
 
@@ -181,6 +181,8 @@ impl JoinPoint {
             );
 
             (*self.0.func)(i as usize);
+
+            // Use release ordering to ensure that the operation result is visible
             let now_finished = self.0.completed_invocations.fetch_add(1, Ordering::Release) + 1;
 
             if now_finished == self.0.total_invocations {
@@ -261,7 +263,7 @@ impl JoinPoint {
         let mut spin_before_sleep = true;
         loop {
             let listener = unsafe { (*self.0.on_change).listen() };
-            if self.0.completed_invocations.load(Ordering::Acquire) < self.0.total_invocations {
+            if self.0.completed_invocations.load(Ordering::Relaxed) < self.0.total_invocations {
                 if self.invoke_child_work() {
                     spin_before_sleep = true;
                 } else {
@@ -274,6 +276,8 @@ impl JoinPoint {
                     spin_before_sleep = !listener.spin_wait(spin_cycles);
                 }
             } else {
+                // Ensure that results from all work items are visible to the calling thread.
+                fence(Ordering::Acquire);
                 break;
             }
         }
