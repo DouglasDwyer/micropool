@@ -87,7 +87,7 @@ pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
             cleanup: &(impl SourceCleanup + Sync),
         ) -> Output {
             ThreadPool::with_current(|f| {
-                f.split_by(self.0).upper_bounded_pipeline(
+                f.split_per(self.0).upper_bounded_pipeline(
                     input_len,
                     init,
                     process_item,
@@ -106,7 +106,7 @@ pub fn split_per(chunk_size: usize) -> impl GenericThreadPool {
             cleanup: &(impl SourceCleanup + Sync),
         ) -> Output {
             ThreadPool::with_current(|f| {
-                f.split_by(self.0)
+                f.split_per(self.0)
                     .iter_pipeline(input_len, accum, reduce, cleanup)
             })
         }

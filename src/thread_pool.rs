@@ -85,7 +85,7 @@ impl ThreadPoolBuilder {
     {
         Self {
             spawn_handler: Box::new(spawn),
-            ..Default::default()
+            ..self
         }
     }
 }
@@ -275,7 +275,7 @@ impl ThreadPool {
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        self.state.should_stop.store(true, Ordering::Release);
+        self.state.should_stop.store(true, Ordering::Relaxed);
         self.state.on_change.notify();
 
         for handle in self.join_handles.drain(..) {
@@ -513,7 +513,7 @@ impl ThreadPoolState {
                 }
                 point.help();
                 JoinPoint::set_current(None);
-            } else if self.should_stop.load(Ordering::Acquire) {
+            } else if self.should_stop.load(Ordering::Relaxed) {
                 return;
             } else if let Some(task) = self.pop_task() {
                 JoinPoint::join_task(&*task, true);
