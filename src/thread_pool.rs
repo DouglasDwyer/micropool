@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 use std::hint::{spin_loop, unreachable_unchecked};
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
-use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::thread::{self, JoinHandle, available_parallelism};
@@ -446,7 +445,7 @@ pub(crate) struct ThreadPoolState {
     /// Raised whenever work is available from queues or tasks.
     pub on_change: Event,
     /// Queues that have pending work.
-    pub roots: spin::Mutex<Deque<*mut WorkQueue, isize>>,
+    pub roots: spin::Mutex<Deque<Option<ScopedRef<WorkQueue>>, isize>>,
     /// Whether the parent [`ThreadPool`] is being dropped.
     /// This indicates that workers should exit.
     pub should_stop: AtomicBool,
@@ -455,6 +454,8 @@ pub(crate) struct ThreadPoolState {
 }
 
 impl ThreadPoolState {
+    // todo: handling for zero threads in push_task and root registration
+
     /// Creates a new state object.
     pub fn new(builder: &ThreadPoolBuilder) -> Self {
         Self {
@@ -479,12 +480,10 @@ impl ThreadPoolState {
 
     /// Schedules a task to be run on the pool.
     pub fn push_task(&self, task: Arc<dyn TaskInner>) {
-        println!("spawn task");
         let mut tasks = self.tasks.lock();
         let no_prior_work = tasks.is_empty();
         tasks.push_back(task);
         drop(tasks);
-        println!("end spawn taks");
         
         if no_prior_work {
             self.on_change.notify();
@@ -499,12 +498,10 @@ impl ThreadPoolState {
         loop {
             let listener = self.on_change.listen();
             
-            if let Some((queue_ptr, item_ptr, first_unit)) = self.reserve_work_unit() {
-                // Safety: the queue will remain valid until the reserved item completes
-                let queue = unsafe { queue_ptr.as_ref() };
+            if let Some((queue, item, first_unit)) = self.reserve_work_unit() {
                 WorkQueueLocalStorage::enter(queue, |queue| {
                     // Safety: the item was reserved from a valid queue beforehand
-                    let complete = unsafe { WorkQueue::help_work_item(item_ptr, first_unit) };
+                    let complete = unsafe { WorkQueue::help_work_item(&item, first_unit) };
                     if complete {
                         queue.on_change.notify();
                     }
@@ -532,23 +529,20 @@ impl ThreadPoolState {
         self.tasks.lock().pop_front()
     }
 
-    fn reserve_work_unit(&self) -> Option<(NonNull<WorkQueue>, NonNull<WorkItem>, usize)> {
-        println!("rwu {:?}", std::thread::current().id());
+    fn reserve_work_unit(&self) -> Option<(ScopedRef<WorkQueue>, ScopedRef<WorkItem>, usize)> {
+        let span = tracy_client::span!("reserve top wu");
+        span.emit_color(0xff9e03);
+
         let mut roots = self.roots.lock();
-        while let Some(maybe_ptr) = roots.front() {
-            if let Some(queue_ptr) = NonNull::new(*maybe_ptr) {
-                // Safety: as long as the item exists in the queue, its pointer is valid
-                let queue = unsafe { queue_ptr.as_ref() };
-                if let Some((item_ptr, first_unit)) = queue.reserve_work_unit_or_clear_root() {
-                    println!("rwud {:?}", std::thread::current().id());
-                    return Some((queue_ptr, item_ptr, first_unit));
-                }
+        while let Some(entry) = roots.front() {
+            if let Some(queue) = entry
+                && let Some((item, first_unit)) = queue.reserve_work_unit_or_clear_root() {
+                return Some((queue.clone(), item, first_unit));
             }
             
             roots.pop_front();
         }
 
-        println!("rwuf {:?}", std::thread::current().id());
         None
     }
 }
@@ -578,46 +572,53 @@ impl WorkQueue {
         match times {
             0 => {}
             1 => f(0),
-            _ => WorkQueueLocalStorage::with(pool, |queue| queue.register_and_invoke(f, times))
+            _ => WorkQueueLocalStorage::with(pool, |queue| Self::register_and_invoke(&queue, f, times))
         }
     }
 
     fn dequeue_item(&self, index: isize) {
+        let span = tracy_client::span!("denq wi");
+        span.emit_color(0xff9e03);
+
         let mut inner = self.state.lock();
         if let Some(entry) = inner.queue.get_mut(index) {
-            *entry = std::ptr::null_mut();
+            *entry = None;
             inner.pending_items -= 1;
         }
     }
 
-    fn enqueue_item(&self, item_ptr: NonNull<WorkItem>) -> isize {
-        let mut inner = self.state.lock();
+    fn enqueue_item(this: &ScopedRef<Self>, item: ScopedRef<WorkItem>) -> isize {
+        let span = tracy_client::span!("enq wi");
+        span.emit_color(0xff9e03);
+
+        let mut inner = this.state.lock();
         let no_prior_work = inner.pending_items == 0;
-        let index = inner.queue.push_back(item_ptr.as_ptr());
+        let index = inner.queue.push_back(Some(item));
         inner.pending_items += 1;
-
-        if no_prior_work {
-            self.on_change.notify();
-
+        
+        let root_index_none = inner.root_index.is_none();
+        drop(inner);
+        if root_index_none {
+            let mut roots = this.pool().roots.lock();
+            let mut inner = this.state.lock();
             if inner.root_index.is_none() {
-                drop(inner);
-                let mut roots = self.pool().roots.lock();
-                let mut inner = self.state.lock();
-                if inner.root_index.is_none() {
-                    inner.root_index = Some(roots.push_back(self as *const _ as *mut _));
-                    drop((roots, inner));
-                    self.pool().on_change.notify();
-                }
+                inner.root_index = Some(roots.push_back(Some(this.clone())));
+                drop((roots, inner));
             }
+        }
+        
+        if no_prior_work {
+            this.on_change.notify();
+            this.pool().on_change.notify();
         }
 
         index
     }
 
     fn help(&self) -> bool {
-        if let Some((item_ptr, first_unit)) = self.reserve_work_unit() {
-            // Safety: `item_ptr` is valid until the reserved work is complete
-            let complete = unsafe { Self::help_work_item(item_ptr, first_unit) };
+        if let Some((item, first_unit)) = self.reserve_work_unit() {
+            // Safety: the given unit has not been completed yet
+            let complete = unsafe { Self::help_work_item(&item, first_unit) };
 
             if complete {
                 self.on_change.notify();
@@ -630,7 +631,7 @@ impl WorkQueue {
         }
     }
 
-    fn register_and_invoke(&self, f: impl Fn(usize), times: usize) {
+    fn register_and_invoke(this: &ScopedRef<Self>, f: impl Fn(usize), times: usize) {
         // Safety: it is always sound to create a pointer
         let func = unsafe {
             std::mem::transmute::<
@@ -646,36 +647,41 @@ impl WorkQueue {
             started_invocations: AtomicU64::new(1),
             total_invocations: times as u64
         };
-        let item_ptr = NonNull::from_ref(&item);
+        
+        ScopedRef::of(&item, |item| {
+            let index = Self::enqueue_item(this, item.clone());
 
-        let index = self.enqueue_item(item_ptr);
+            // Safety: unit `0` was reserved for this thread before it was queued
+            let complete = unsafe { Self::help_work_item(&item, 0) };
 
-        // Safety: `item_ptr` is valid for the duration of the call
-        let complete = unsafe { Self::help_work_item(item_ptr, 0) };
+            if !complete {
+                this.wait_until_complete(&item);
+            }
 
-        if !complete {
-            self.wait_until_complete(&item);
-        }
+            // Ensure that results from all work items are visible to the calling thread.
+            fence(Ordering::Acquire);
 
-        // Ensure that results from all work items are visible to the calling thread.
-        fence(Ordering::Acquire);
-
-        if item.enqueued.load(Ordering::Relaxed) {
-            self.dequeue_item(index);
-        }
+            if item.enqueued.load(Ordering::Relaxed) {
+                this.dequeue_item(index);
+            }
+        });
     }
     
     /// Searches for available work at the beginning of the queue.
     /// If found, the work unit is marked as taken, so it is the caller's
     /// responsibility to invoke [`Self::help_work_item`] on it.
-    fn reserve_work_unit(&self) -> Option<(NonNull<WorkItem>, usize)> {
+    fn reserve_work_unit(&self) -> Option<(ScopedRef<WorkItem>, usize)> {
+        let span = tracy_client::span!("reserve wu");
+        span.emit_color(0xff9e03);
         Self::reserve_work_unit_inner(&mut self.state.lock())
     }
     
     /// Searches for available work at the beginning of the queue.
     /// If found, the work unit is marked as taken, so it is the caller's
     /// responsibility to invoke [`Self::help_work_item`] on it.
-    fn reserve_work_unit_or_clear_root(&self) -> Option<(NonNull<WorkItem>, usize)> {
+    fn reserve_work_unit_or_clear_root(&self) -> Option<(ScopedRef<WorkItem>, usize)> {
+        let span = tracy_client::span!("reserve wu or clear");
+        span.emit_color(0xff9e03);
         let mut state = self.state.lock();
         let result = Self::reserve_work_unit_inner(&mut state);
 
@@ -689,6 +695,9 @@ impl WorkQueue {
     /// Waits for pending units on `item` to finish processing.
     /// In the meantime, calls [`Self::help`] to steal other work items.
     fn wait_until_complete(&self, item: &WorkItem) {
+        let span = tracy_client::span!("wait for compl");
+        span.emit_color(0xff9e03);
+
         let mut spin_before_sleep = true;
         let mut first_time = false;
         loop {
@@ -718,19 +727,20 @@ impl WorkQueue {
         self.pool.expect("pool was not initialized")
     }
 
-    /// Executes pending work for `item_ptr`, starting with `first_unit` (which
+    /// Executes pending work for `item`, starting with `first_unit` (which
     /// should already have been reserved). Returns whether the work item was fully completed
     /// as a result of this call.
     /// 
     /// # Safety
     /// 
-    /// `item_ptr` must refer to a valid item that resides in this queue.
     /// `first_unit` must be a unique index not processsed by any other thread.
-    /// Once this function completes, `item_ptr` might no longer be valid
+    /// Once this function completes, `item` might no longer be valid
     /// (since the owning thread may deallocate it).
-    unsafe fn help_work_item(item_ptr: NonNull<WorkItem>, first_unit: usize) -> bool {
-        // Safety: the pointer is valid until we increment `completed_invocations`
-        let item = unsafe { item_ptr.as_ref() };
+    unsafe fn help_work_item(item: &WorkItem, first_unit: usize) -> bool {
+        //let span = tracy_client::span!("run wu");
+        //span.emit_color(0xff9e03);
+        //span.emit_value(first_unit as u64);
+
         let total_invocations = item.total_invocations;
 
         let mut locally_completed = 1;
@@ -756,12 +766,17 @@ impl WorkQueue {
     /// Searches for available work at the beginning of the queue.
     /// If found, the work unit is marked as taken, so it is the caller's
     /// responsibility to invoke [`Self::help_work_item`] on it.
-    fn reserve_work_unit_inner(inner: &mut WorkQueueState) -> Option<(NonNull<WorkItem>, usize)> {
-        while let Some(maybe_ptr) = inner.queue.front_mut() {
-            if let Some(item_ptr) = NonNull::new(*maybe_ptr) {
-                // Safety: as long as the item exists in the queue, its pointer is valid
-                let item = unsafe { item_ptr.as_ref() };
+    fn reserve_work_unit_inner(inner: &mut WorkQueueState) -> Option<(ScopedRef<WorkItem>, usize)> {
+        while let Some(entry) = inner.queue.front_mut() {
+            if let Some(item) = entry {
                 let first_unit = item.started_invocations.fetch_add(1, Ordering::Relaxed);
+
+                let result = if first_unit < item.total_invocations {
+                    Some((item.clone(), first_unit as usize))
+                }
+                else {
+                    None
+                };
 
                 if item.total_invocations <= first_unit + 1 {
                     item.enqueued.store(false, Ordering::Relaxed);
@@ -769,8 +784,8 @@ impl WorkQueue {
                     inner.pending_items -= 1;
                 }
 
-                if first_unit < item.total_invocations {
-                    return Some((item_ptr, first_unit as usize));
+                if result.is_some() {
+                    return result;
                 }
             }
             else {
@@ -782,6 +797,8 @@ impl WorkQueue {
     }
 }
 
+// todo: move away from NonNull to Option<ScopedRef<>>
+
 /// The mutable inner state for a [`WorkQueue`].
 #[derive(Debug, Default)]
 struct WorkQueueState {
@@ -789,7 +806,7 @@ struct WorkQueueState {
     pub pending_items: usize,
     /// Holds work items that (potentially) have units that need to start.
     /// Once an item is fully started, its pointer will be overwritten with null here.
-    pub queue: Deque<*mut WorkItem, isize>,
+    pub queue: Deque<Option<ScopedRef<WorkItem>>, isize>,
     pub root_index: Option<isize>,
 }
 
@@ -809,7 +826,7 @@ struct WorkItem {
 }
 
 thread_local! {
-    static CURRENT_QUEUE: Cell<*const WorkQueue> = const { Cell::new(std::ptr::null()) };
+    static CURRENT_QUEUE: Cell<Option<ScopedRef<WorkQueue>>> = const { Cell::new(None) };
     static QUEUE_STORAGE: UnsafeCell<WorkQueue> = UnsafeCell::default();
 }
 
@@ -817,10 +834,9 @@ thread_local! {
 struct WorkQueueLocalStorage;
 
 impl WorkQueueLocalStorage {
-    pub fn with(pool: &'static ThreadPoolState, f: impl FnOnce(&WorkQueue)) {
-        // Safety: CURRENT_QUEUE is only non-null within a call to `Self::enter`
-        // (which will be somewhere up the stack) so this reference should be valid.
-        if let Some(queue) = unsafe { CURRENT_QUEUE.get().as_ref() } {
+    pub fn with(pool: &'static ThreadPoolState, f: impl FnOnce(ScopedRef<WorkQueue>)) {
+        if let Some(queue) = CURRENT_QUEUE.take() {
+            CURRENT_QUEUE.set(Some(queue.clone()));
             assert!(std::ptr::eq(queue.pool(), pool), "attempted to parallelize work with two different thread pools simultaneously");
             f(queue)
         }
@@ -830,25 +846,27 @@ impl WorkQueueLocalStorage {
                 // will not be borrowed mutably as the result of a recursive call
                 let queue = unsafe { &mut *storage.get() };
                 queue.pool = Some(pool);
-                Self::enter(queue, f);
+                queue.state.get_mut().root_index = None;
 
-                {
+                ScopedRef::of(queue, |queue| {
+                    Self::enter(queue.clone(), f);
+
                     let mut inner = queue.state.lock();
                     if let Some(index) = inner.root_index {
                         drop(inner);
-                        if let Some(queue_ptr) = pool.roots.lock().get_mut(index) {
-                            *queue_ptr = std::ptr::null_mut();
+                        if let Some(entry) = pool.roots.lock().get_mut(index) {
+                            *entry = None;
                         }
                     }
-                }
+                });
             })
         }
     }
 
-    pub fn enter(queue: &WorkQueue, f: impl FnOnce(&WorkQueue)) {
-        assert!(CURRENT_QUEUE.get().is_null(), "attempted to enter queue more than once");
-        CURRENT_QUEUE.set(queue);
+    pub fn enter(queue: ScopedRef<WorkQueue>, f: impl FnOnce(ScopedRef<WorkQueue>)) {
+        assert!(CURRENT_QUEUE.take().is_none(), "attempted to enter queue more than once");
+        CURRENT_QUEUE.set(Some(queue.clone()));
         f(queue);
-        CURRENT_QUEUE.set(std::ptr::null());
+        CURRENT_QUEUE.set(None);
     }
 }

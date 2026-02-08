@@ -44,12 +44,14 @@ impl<T: 'static + Send> OwnedTask<T> {
     #[inline(always)]
     pub fn help(&self) {
         // todo
+        self.0.run();
     }
 
     /// Joins the current thread with this task, completing all remaining work.
     /// After all work is complete, yields the result.
     #[inline(always)]
     pub fn join(self) -> T {
+        self.0.run();
         self.0.result.wait();
 
         self.0
@@ -132,7 +134,7 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
     #[inline(always)]
     pub fn help(&self) {
         // todo
-        //todo!()
+        self.0.run();
     }
 
     /// Joins the current thread with this task, completing all remaining work.
@@ -140,7 +142,7 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
     #[inline(always)]
     pub fn join(&self) -> &T {
         if !self.complete() {
-            // todo
+            self.0.run();
             self.0.result.wait();
         }
 
@@ -195,11 +197,10 @@ struct TypedTaskInner<T: Send + Sync> {
 impl<T: Send + Sync> TaskInner for TypedTaskInner<T> {
     #[inline(always)]
     fn run(&self) {
-        let result = self
-            .func
-            .take()
-            .expect("TaskInner::run called multiple times")();
-        self.result.call_once(|| result);
+        if let Some(f) = self.func.take() {
+            let result = f();
+            self.result.call_once(|| result);
+        }        
     }
 }
 

@@ -1,4 +1,6 @@
 use std::hint::{black_box, spin_loop};
+use std::ops::Deref;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::thread::{self};
 use wait_on_address::AtomicWait;
@@ -149,3 +151,86 @@ pub fn abort_on_panic<R, F: FnOnce() -> R>(f: F) -> R {
     let _guard = PanicGuard;
     f()
 }
+
+/// Allows for erasing lifetimes and sharing references on the stack.
+pub struct ScopedRef<T> {
+    /// Shared data.
+    data: NonNull<T>,
+    /// The number of outstanding shared references.
+    ref_count: NonNull<AtomicUsize>
+}
+
+impl<T> ScopedRef<T> {
+    /// Wraps `value` in a [`ScopedRef`], which is provided to `scope`.
+    /// Once `scope` completes, this function will block until all
+    /// clones of the reference are dropped.
+    pub fn of<R>(value: &T, scope: impl FnOnce(Self) -> R) -> R {
+        let ref_count = AtomicUsize::new(1);
+
+        abort_on_panic(|| {
+            let result = scope(ScopedRef {
+                data: NonNull::from_ref(value),
+                ref_count: NonNull::from_ref(&ref_count)
+            });
+            
+            {
+                let span = tracy_client::span!("release scoped ref");
+                span.emit_color(0xff9e03);
+                while 0 < ref_count.load(Ordering::Relaxed) {
+                    spin_loop();
+                }
+            }
+
+            // Synchronize memory access with other threads before deleting the object
+            fence(Ordering::Acquire);
+
+            result
+        })
+    }
+
+    /// Determines whether two scoped references refer to the same underlying
+    /// object.
+    pub fn ptr_eq(lhs: &Self, rhs: &Self) -> bool {
+        lhs.data == rhs.data
+    }
+}
+
+impl<T> Clone for ScopedRef<T> {
+    fn clone(&self) -> Self {
+        unsafe {
+            self.ref_count.as_ref().fetch_add(1, Ordering::Relaxed);
+
+            Self {
+                data: self.data,
+                ref_count: self.ref_count
+            }
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for ScopedRef<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ScopedRef")
+            .field(&*self)
+            .finish()
+    }
+}
+
+impl<T> Deref for ScopedRef<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.data.as_ref() }
+    }
+}
+
+impl<T> Drop for ScopedRef<T> {
+    fn drop(&mut self) {
+        unsafe {
+            self.ref_count.as_ref().fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+unsafe impl<T: Send + Sync> Send for ScopedRef<T> {}
+unsafe impl<T: Send + Sync> Sync for ScopedRef<T> {}
