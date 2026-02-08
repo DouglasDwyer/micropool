@@ -1,16 +1,17 @@
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
-use std::hint::unreachable_unchecked;
+use std::hint::{spin_loop, unreachable_unchecked};
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
+use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::thread::{self, JoinHandle, available_parallelism};
 
 use paralight::iter::{Accumulator, ExactSizeAccumulator, GenericThreadPool, SourceCleanup};
 use smallvec::SmallVec;
+use vecdeque_stableix::Deque;
 
-use crate::join_point::*;
 use crate::util::*;
 use crate::{OwnedTask, SharedTask, TaskInner};
 
@@ -145,11 +146,6 @@ impl ThreadPool {
     /// task.
     pub fn install<R>(&self, f: impl FnOnce() -> R) -> R {
         abort_on_panic(|| {
-            assert!(
-                JoinPoint::current().is_none(),
-                "Attempted to enter pool from within another context."
-            );
-
             let previous = LOCAL_POOL.get();
             LOCAL_POOL.set(self);
             let result = f();
@@ -212,7 +208,7 @@ impl ThreadPool {
             let result_a = UnsafeCell::new(MaybeUninit::uninit());
             let result_b = UnsafeCell::new(MaybeUninit::uninit());
 
-            JoinPoint::invoke(
+            WorkQueue::invoke(
                 self.state,
                 |i| match i {
                     0 => {
@@ -302,7 +298,7 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
             output.reserve_exact(input_len);
             let output_buffer = output.as_mut_ptr();
 
-            JoinPoint::invoke(
+            WorkQueue::invoke(
                 self.0.state,
                 |i| {
                     output_buffer
@@ -334,7 +330,7 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
             output.reserve_exact(input_len);
             let output_buffer = output.as_mut_ptr();
 
-            JoinPoint::invoke(
+            WorkQueue::invoke(
                 self.0.state,
                 |i| {
                     output_buffer.add(i).write(accum.accumulate(i..i + 1));
@@ -376,7 +372,7 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
             let break_early = AtomicBool::new(false);
             let output_buffer = output.as_mut_ptr();
 
-            JoinPoint::invoke(
+            WorkQueue::invoke(
                 self.pool.state,
                 |i| {
                     let start = chunk_size * i;
@@ -428,15 +424,12 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
             output.reserve_exact(work_units);
             let output_buffer = output.as_mut_ptr();
 
-            JoinPoint::invoke(
-                self.pool.state,
+            WorkQueue::invoke(self.pool.state,
                 |i| {
                     let start = chunk_size * i;
                     let end = (start + chunk_size).min(input_len);
                     output_buffer.add(i).write(accum.accumulate(start..end));
-                },
-                work_units,
-            );
+                }, work_units);
 
             output.set_len(work_units);
             reduce.accumulate_exact(output.into_iter())
@@ -446,15 +439,14 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
 
 /// Stores the inner state for a [`ThreadPool`] and coordinates work across
 /// multiple threads.
-#[derive(Default)]
 pub(crate) struct ThreadPoolState {
     /// Threads waiting for work will spin for at least this many cycles before
     /// sleeping.
     pub idle_spin_cycles: usize,
-    /// An event that is invoked whenever new work is available.
+    /// Raised whenever work is available from queues or tasks.
     pub on_change: Event,
-    /// Join points where pool threads should look for work.
-    pub roots: spin::RwLock<Vec<JoinPoint>>,
+    /// Queues that have pending work.
+    pub roots: spin::Mutex<Deque<*mut WorkQueue, isize>>,
     /// Whether the parent [`ThreadPool`] is being dropped.
     /// This indicates that workers should exit.
     pub should_stop: AtomicBool,
@@ -468,7 +460,7 @@ impl ThreadPoolState {
         Self {
             idle_spin_cycles: builder.idle_spin_cycles,
             on_change: Event::new(),
-            roots: spin::RwLock::new(Vec::new()),
+            roots: spin::Mutex::default(),
             should_stop: AtomicBool::new(false),
             tasks: spin::Mutex::new(VecDeque::new()),
         }
@@ -487,36 +479,42 @@ impl ThreadPoolState {
 
     /// Schedules a task to be run on the pool.
     pub fn push_task(&self, task: Arc<dyn TaskInner>) {
-        self.tasks.lock().push_back(task);
-        self.on_change.notify();
+        println!("spawn task");
+        let mut tasks = self.tasks.lock();
+        let no_prior_work = tasks.is_empty();
+        tasks.push_back(task);
+        drop(tasks);
+        println!("end spawn taks");
+        
+        if no_prior_work {
+            self.on_change.notify();
+        }
     }
 
     /// Polls for available work on the thread pool, and goes to sleep if none
     /// is available.
     fn join(&self) {
-        assert!(
-            JoinPoint::current().is_none(),
-            "Attempted to enter pool from within another context"
-        );
-
         let mut spin_before_sleep = false;
 
         loop {
             let listener = self.on_change.listen();
-            let item = JoinPoint::select_work_unit_from(&self.roots.read());
-
-            if let Some((point, i)) = item {
+            
+            if let Some((queue_ptr, item_ptr, first_unit)) = self.reserve_work_unit() {
+                // Safety: the queue will remain valid until the reserved item completes
+                let queue = unsafe { queue_ptr.as_ref() };
+                WorkQueueLocalStorage::enter(queue, |queue| {
+                    // Safety: the item was reserved from a valid queue beforehand
+                    let complete = unsafe { WorkQueue::help_work_item(item_ptr, first_unit) };
+                    if complete {
+                        queue.on_change.notify();
+                    }
+                });
+                
                 spin_before_sleep = true;
-                JoinPoint::set_current(Some(point.clone()));
-                unsafe {
-                    point.invoke_work_unit(i);
-                }
-                point.help();
-                JoinPoint::set_current(None);
             } else if self.should_stop.load(Ordering::Relaxed) {
                 return;
             } else if let Some(task) = self.pop_task() {
-                JoinPoint::join_task(&*task, true);
+                task.run();
             } else {
                 // Only spin if something was found to do since the last sleep
                 let spin_cycles = if spin_before_sleep {
@@ -533,7 +531,324 @@ impl ThreadPoolState {
     fn pop_task(&self) -> Option<Arc<dyn TaskInner>> {
         self.tasks.lock().pop_front()
     }
+
+    fn reserve_work_unit(&self) -> Option<(NonNull<WorkQueue>, NonNull<WorkItem>, usize)> {
+        println!("rwu {:?}", std::thread::current().id());
+        let mut roots = self.roots.lock();
+        while let Some(maybe_ptr) = roots.front() {
+            if let Some(queue_ptr) = NonNull::new(*maybe_ptr) {
+                // Safety: as long as the item exists in the queue, its pointer is valid
+                let queue = unsafe { queue_ptr.as_ref() };
+                if let Some((item_ptr, first_unit)) = queue.reserve_work_unit_or_clear_root() {
+                    println!("rwud {:?}", std::thread::current().id());
+                    return Some((queue_ptr, item_ptr, first_unit));
+                }
+            }
+            
+            roots.pop_front();
+        }
+
+        println!("rwuf {:?}", std::thread::current().id());
+        None
+    }
+}
+
+impl std::fmt::Debug for ThreadPoolState {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("ThreadPoolState")
+            .finish_non_exhaustive()
+    }
 }
 
 unsafe impl Send for ThreadPoolState {}
 unsafe impl Sync for ThreadPoolState {}
+
+#[derive(Debug, Default)]
+struct WorkQueue {
+    /// Raised whenever a work item is created or finished.
+    on_change: Event,
+    /// The associated thread pool.
+    pool: Option<&'static ThreadPoolState>,
+    /// Inner state used for work tracking.
+    state: spin::Mutex<WorkQueueState>
+}
+
+impl WorkQueue {
+    pub unsafe fn invoke(pool: &'static ThreadPoolState, f: impl Fn(usize), times: usize) {
+        match times {
+            0 => {}
+            1 => f(0),
+            _ => WorkQueueLocalStorage::with(pool, |queue| queue.register_and_invoke(f, times))
+        }
+    }
+
+    fn dequeue_item(&self, index: isize) {
+        let mut inner = self.state.lock();
+        if let Some(entry) = inner.queue.get_mut(index) {
+            *entry = std::ptr::null_mut();
+            inner.pending_items -= 1;
+        }
+    }
+
+    fn enqueue_item(&self, item_ptr: NonNull<WorkItem>) -> isize {
+        let mut inner = self.state.lock();
+        let no_prior_work = inner.pending_items == 0;
+        let index = inner.queue.push_back(item_ptr.as_ptr());
+        inner.pending_items += 1;
+
+        if no_prior_work {
+            self.on_change.notify();
+
+            if inner.root_index.is_none() {
+                drop(inner);
+                let mut roots = self.pool().roots.lock();
+                let mut inner = self.state.lock();
+                if inner.root_index.is_none() {
+                    inner.root_index = Some(roots.push_back(self as *const _ as *mut _));
+                    drop((roots, inner));
+                    self.pool().on_change.notify();
+                }
+            }
+        }
+
+        index
+    }
+
+    fn help(&self) -> bool {
+        if let Some((item_ptr, first_unit)) = self.reserve_work_unit() {
+            // Safety: `item_ptr` is valid until the reserved work is complete
+            let complete = unsafe { Self::help_work_item(item_ptr, first_unit) };
+
+            if complete {
+                self.on_change.notify();
+            }
+
+            true
+        }
+        else {
+            false
+        }
+    }
+
+    fn register_and_invoke(&self, f: impl Fn(usize), times: usize) {
+        // Safety: it is always sound to create a pointer
+        let func = unsafe {
+            std::mem::transmute::<
+                *const (dyn Fn(usize) + '_),
+                *const (dyn Fn(usize) + 'static),
+            >(&f as *const dyn Fn(usize))
+        };
+
+        let item = WorkItem {
+            completed_invocations: AtomicU64::new(0),
+            enqueued: AtomicBool::new(true),
+            func,
+            started_invocations: AtomicU64::new(1),
+            total_invocations: times as u64
+        };
+        let item_ptr = NonNull::from_ref(&item);
+
+        let index = self.enqueue_item(item_ptr);
+
+        // Safety: `item_ptr` is valid for the duration of the call
+        let complete = unsafe { Self::help_work_item(item_ptr, 0) };
+
+        if !complete {
+            self.wait_until_complete(&item);
+        }
+
+        // Ensure that results from all work items are visible to the calling thread.
+        fence(Ordering::Acquire);
+
+        if item.enqueued.load(Ordering::Relaxed) {
+            self.dequeue_item(index);
+        }
+    }
+    
+    /// Searches for available work at the beginning of the queue.
+    /// If found, the work unit is marked as taken, so it is the caller's
+    /// responsibility to invoke [`Self::help_work_item`] on it.
+    fn reserve_work_unit(&self) -> Option<(NonNull<WorkItem>, usize)> {
+        Self::reserve_work_unit_inner(&mut self.state.lock())
+    }
+    
+    /// Searches for available work at the beginning of the queue.
+    /// If found, the work unit is marked as taken, so it is the caller's
+    /// responsibility to invoke [`Self::help_work_item`] on it.
+    fn reserve_work_unit_or_clear_root(&self) -> Option<(NonNull<WorkItem>, usize)> {
+        let mut state = self.state.lock();
+        let result = Self::reserve_work_unit_inner(&mut state);
+
+        if result.is_none() {
+            state.root_index = None;
+        }
+
+        result
+    }
+
+    /// Waits for pending units on `item` to finish processing.
+    /// In the meantime, calls [`Self::help`] to steal other work items.
+    fn wait_until_complete(&self, item: &WorkItem) {
+        let mut spin_before_sleep = true;
+        let mut first_time = false;
+        loop {
+            let listener = self.on_change.listen();
+            if item.completed_invocations.load(Ordering::Relaxed) < item.total_invocations {
+                if self.help() {
+                    spin_before_sleep = true;
+                }
+                else {
+                    // Only spin if something was found to do since the last sleep
+                    let spin_cycles = if spin_before_sleep {
+                        self.pool().idle_spin_cycles
+                    } else {
+                        0
+                    };
+                    spin_before_sleep = !listener.spin_wait(spin_cycles);
+                }
+            }
+            else {
+                break;
+            }
+        }
+    }
+
+    /// Gets the thread pool currently associated with this queue.
+    fn pool(&self) -> &'static ThreadPoolState {
+        self.pool.expect("pool was not initialized")
+    }
+
+    /// Executes pending work for `item_ptr`, starting with `first_unit` (which
+    /// should already have been reserved). Returns whether the work item was fully completed
+    /// as a result of this call.
+    /// 
+    /// # Safety
+    /// 
+    /// `item_ptr` must refer to a valid item that resides in this queue.
+    /// `first_unit` must be a unique index not processsed by any other thread.
+    /// Once this function completes, `item_ptr` might no longer be valid
+    /// (since the owning thread may deallocate it).
+    unsafe fn help_work_item(item_ptr: NonNull<WorkItem>, first_unit: usize) -> bool {
+        // Safety: the pointer is valid until we increment `completed_invocations`
+        let item = unsafe { item_ptr.as_ref() };
+        let total_invocations = item.total_invocations;
+
+        let mut locally_completed = 1;
+        // Safety: the function is valid and has not been called with `first_unit` yet
+        unsafe { (*item.func)(first_unit); }
+
+        loop {
+            let next_unit = item.started_invocations.fetch_add(1, Ordering::Relaxed);
+            if next_unit < item.total_invocations {
+                // Safety: the function is valid and has not been called with `next_unit` yet
+                unsafe { (*item.func)(next_unit as usize) };
+                locally_completed += 1;
+            }
+            else {
+                break;
+            }
+        }
+
+        let now_finished = item.completed_invocations.fetch_add(locally_completed, Ordering::Release) + locally_completed;
+        now_finished == total_invocations
+    }
+    
+    /// Searches for available work at the beginning of the queue.
+    /// If found, the work unit is marked as taken, so it is the caller's
+    /// responsibility to invoke [`Self::help_work_item`] on it.
+    fn reserve_work_unit_inner(inner: &mut WorkQueueState) -> Option<(NonNull<WorkItem>, usize)> {
+        while let Some(maybe_ptr) = inner.queue.front_mut() {
+            if let Some(item_ptr) = NonNull::new(*maybe_ptr) {
+                // Safety: as long as the item exists in the queue, its pointer is valid
+                let item = unsafe { item_ptr.as_ref() };
+                let first_unit = item.started_invocations.fetch_add(1, Ordering::Relaxed);
+
+                if item.total_invocations <= first_unit + 1 {
+                    item.enqueued.store(false, Ordering::Relaxed);
+                    inner.queue.pop_front();
+                    inner.pending_items -= 1;
+                }
+
+                if first_unit < item.total_invocations {
+                    return Some((item_ptr, first_unit as usize));
+                }
+            }
+            else {
+                inner.queue.pop_front();
+            }            
+        }
+
+        None
+    }
+}
+
+/// The mutable inner state for a [`WorkQueue`].
+#[derive(Debug, Default)]
+struct WorkQueueState {
+    /// The total number of non-null entries in [`Self::queue`].
+    pub pending_items: usize,
+    /// Holds work items that (potentially) have units that need to start.
+    /// Once an item is fully started, its pointer will be overwritten with null here.
+    pub queue: Deque<*mut WorkItem, isize>,
+    pub root_index: Option<isize>,
+}
+
+/// Tracks a parallel computation.
+#[derive(Debug)]
+struct WorkItem {
+    /// The number of units that have finished.
+    pub completed_invocations: AtomicU64,
+    /// Whether the work item is still registered in the [`WorkQueueState::queue`].
+    pub enqueued: AtomicBool,
+    /// The function to invoke. Accepts the unit index as an argument.
+    pub func: *const (dyn 'static + Fn(usize)),
+    /// The number of units that have started.
+    pub started_invocations: AtomicU64,
+    /// The total number of units to invoke.
+    pub total_invocations: u64,
+}
+
+thread_local! {
+    static CURRENT_QUEUE: Cell<*const WorkQueue> = const { Cell::new(std::ptr::null()) };
+    static QUEUE_STORAGE: UnsafeCell<WorkQueue> = UnsafeCell::default();
+}
+
+#[derive(Debug, Default)]
+struct WorkQueueLocalStorage;
+
+impl WorkQueueLocalStorage {
+    pub fn with(pool: &'static ThreadPoolState, f: impl FnOnce(&WorkQueue)) {
+        // Safety: CURRENT_QUEUE is only non-null within a call to `Self::enter`
+        // (which will be somewhere up the stack) so this reference should be valid.
+        if let Some(queue) = unsafe { CURRENT_QUEUE.get().as_ref() } {
+            assert!(std::ptr::eq(queue.pool(), pool), "attempted to parallelize work with two different thread pools simultaneously");
+            f(queue)
+        }
+        else {
+            QUEUE_STORAGE.with(|storage| {
+                // Safety: `Self::enter` will set the current queue, so storage
+                // will not be borrowed mutably as the result of a recursive call
+                let queue = unsafe { &mut *storage.get() };
+                queue.pool = Some(pool);
+                Self::enter(queue, f);
+
+                {
+                    let mut inner = queue.state.lock();
+                    if let Some(index) = inner.root_index {
+                        drop(inner);
+                        if let Some(queue_ptr) = pool.roots.lock().get_mut(index) {
+                            *queue_ptr = std::ptr::null_mut();
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    pub fn enter(queue: &WorkQueue, f: impl FnOnce(&WorkQueue)) {
+        assert!(CURRENT_QUEUE.get().is_null(), "attempted to enter queue more than once");
+        CURRENT_QUEUE.set(queue);
+        f(queue);
+        CURRENT_QUEUE.set(std::ptr::null());
+    }
+}

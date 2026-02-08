@@ -2,6 +2,8 @@
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
+#![allow(warnings)]
+
 use std::ops::ControlFlow;
 
 pub use paralight::iter;
@@ -10,8 +12,8 @@ use paralight::iter::{Accumulator, ExactSizeAccumulator, GenericThreadPool, Sour
 pub use self::task::*;
 pub use self::thread_pool::*;
 
-/// Internal tracking for work trees executing on a thread pool.
-mod join_point;
+// Internal tracking for work trees executing on a thread pool.
+//mod join_point;
 
 /// Implementation of tasks for the [`spawn`] API.
 mod task;
@@ -21,6 +23,8 @@ mod thread_pool;
 
 /// Synchronization primitives and helper types used in the implementation.
 mod util;
+
+//mod work_queue;
 
 /// Execute [`paralight`] iterators with maximal parallelism.
 /// Every iterator item may be processed on a separate thread.
@@ -305,5 +309,5 @@ mod tests {
                 crate::spawn_owned(|| std::thread::sleep(std::time::Duration::new(0, 200)));
             assert_eq!(third_task.join(), fourth_task.join());
         }
-    }
+    } 
 }

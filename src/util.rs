@@ -1,6 +1,4 @@
 use std::hint::{black_box, spin_loop};
-use std::ops::Deref;
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::thread::{self};
 use wait_on_address::AtomicWait;
@@ -150,78 +148,4 @@ pub fn abort_on_panic<R, F: FnOnce() -> R>(f: F) -> R {
 
     let _guard = PanicGuard;
     f()
-}
-
-/// Allows for erasing lifetimes and sharing references on the stack.
-pub struct ScopedRef<T>(NonNull<ScopedHolder<T>>);
-
-impl<T> ScopedRef<T> {
-    /// Wraps `value` in a [`ScopedRef`], which is provided to `scope`.
-    /// Once `scope` completes, this function will block until all
-    /// clones of the reference are dropped.
-    pub fn of<R>(value: T, scope: impl FnOnce(Self) -> R) -> R {
-        let holder = ScopedHolder {
-            ref_count: AtomicUsize::new(1),
-            value,
-        };
-        let _dropper = ScopedHolderDropper(&holder);
-        scope(ScopedRef(NonNull::from_ref(&holder)))
-    }
-
-    /// Determines whether two scoped references refer to the same underlying
-    /// object.
-    pub fn ptr_eq(lhs: &Self, rhs: &Self) -> bool {
-        lhs.0 == rhs.0
-    }
-}
-
-impl<T> Clone for ScopedRef<T> {
-    fn clone(&self) -> Self {
-        unsafe {
-            self.0.as_ref().ref_count.fetch_add(1, Ordering::Relaxed);
-            Self(self.0)
-        }
-    }
-}
-
-impl<T> Deref for ScopedRef<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &self.0.as_ref().value }
-    }
-}
-
-impl<T> Drop for ScopedRef<T> {
-    fn drop(&mut self) {
-        unsafe {
-            self.0.as_ref().ref_count.fetch_sub(1, Ordering::Release);
-        }
-    }
-}
-
-unsafe impl<T: Send + Sync> Send for ScopedRef<T> {}
-unsafe impl<T: Send + Sync> Sync for ScopedRef<T> {}
-
-/// Stores the inner state for a [`ScopedRef`].
-struct ScopedHolder<T> {
-    /// The number of active references to this holder.
-    ref_count: AtomicUsize,
-    /// The underlying value.
-    value: T,
-}
-
-/// Ensures that [`ScopedHolder`] is not freed until all references
-/// to it are dropped.
-struct ScopedHolderDropper<'a, T>(&'a ScopedHolder<T>);
-
-impl<T> Drop for ScopedHolderDropper<'_, T> {
-    fn drop(&mut self) {
-        while 0 < self.0.ref_count.load(Ordering::Relaxed) {
-            spin_loop();
-        }
-
-        // Synchronize memory access with other threads before deleting the object
-        fence(Ordering::Acquire);
-    }
 }

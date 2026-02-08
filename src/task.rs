@@ -3,7 +3,6 @@ use std::sync::Arc;
 use takecell::TakeOwnCell;
 
 use crate::ThreadPoolState;
-use crate::join_point::JoinPoint;
 
 /// A task whose result is exclusively owned by the caller.
 pub struct OwnedTask<T: 'static + Send>(Arc<TypedTaskInner<TakeOwnCell<T>>>);
@@ -30,7 +29,7 @@ impl<T: 'static + Send> OwnedTask<T> {
     /// Cancels this task, preventing it from running if it was not yet started.
     #[inline(always)]
     pub fn cancel(self) {
-        self.0.pool().cancel_task(&self.0);
+        self.0.pool.cancel_task(&self.0);
     }
 
     /// Whether the task has been completed yet.
@@ -44,14 +43,15 @@ impl<T: 'static + Send> OwnedTask<T> {
     /// threads.
     #[inline(always)]
     pub fn help(&self) {
-        JoinPoint::join_task(&*self.0, true);
+        // todo
     }
 
     /// Joins the current thread with this task, completing all remaining work.
     /// After all work is complete, yields the result.
     #[inline(always)]
     pub fn join(self) -> T {
-        JoinPoint::join_task(&*self.0, false);
+        self.0.result.wait();
+
         self.0
             .result
             .get()
@@ -116,7 +116,7 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
         // less than three, but in that case `cancel_task` is a no-op. So, this
         // is correct.
         if Arc::strong_count(&self.0) < 3 {
-            self.0.pool().cancel_task(&self.0);
+            self.0.pool.cancel_task(&self.0);
         }
     }
 
@@ -131,7 +131,8 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
     /// threads.
     #[inline(always)]
     pub fn help(&self) {
-        JoinPoint::join_task(&*self.0, true);
+        // todo
+        //todo!()
     }
 
     /// Joins the current thread with this task, completing all remaining work.
@@ -139,7 +140,8 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
     #[inline(always)]
     pub fn join(&self) -> &T {
         if !self.complete() {
-            JoinPoint::join_task(&*self.0, false);
+            // todo
+            self.0.result.wait();
         }
 
         self.0.result.get().expect("Failed to get result of task")
@@ -173,12 +175,6 @@ impl<T: 'static + Send + Sync> std::fmt::Debug for SharedTask<T> {
 
 /// Allows for thread pools to manipulate the inner task state.
 pub(crate) trait TaskInner: Send {
-    /// The thread pool on which this work is spawned.
-    fn pool(&self) -> &'static ThreadPoolState;
-
-    /// Gets a reference to the state tracker for the task.
-    fn state(&self) -> &spin::RwLock<TaskState>;
-
     /// Executes the inner task. This should be called once by a single thread
     /// in the correct pool context.
     fn run(&self);
@@ -198,16 +194,6 @@ struct TypedTaskInner<T: Send + Sync> {
 
 impl<T: Send + Sync> TaskInner for TypedTaskInner<T> {
     #[inline(always)]
-    fn pool(&self) -> &'static ThreadPoolState {
-        self.pool
-    }
-
-    #[inline(always)]
-    fn state(&self) -> &spin::RwLock<TaskState> {
-        &self.state
-    }
-
-    #[inline(always)]
     fn run(&self) {
         let result = self
             .func
@@ -223,7 +209,7 @@ pub(crate) enum TaskState {
     /// The task has not yet been started.
     NotStarted,
     /// The task is running with the given root join point.
-    Running(JoinPoint),
+    Running(()),  // (WorkQueue, NonNull<WorkItem>) instead?
     /// The task has finished execution.
     Complete,
 }
