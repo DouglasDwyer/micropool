@@ -1,4 +1,4 @@
-use std::hint::{black_box, spin_loop};
+use std::hint::{spin_loop};
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
@@ -78,14 +78,14 @@ impl<'a> EventListener<'a> {
     /// Whether [`Event::notify`] has been called at least once after this
     /// object's creation.
     pub fn signaled(&self) -> bool {
-        let atomic = self.event.atomic.load(Ordering::Relaxed);
-        if self.version == (atomic & !Event::WAITER_FLAG) {
-            false
-        } else {
+        if self.signaled_relaxed() {
             // Since the version incremented, memory writes from signaling threads
             // must be made visible to this thread.
             fence(Ordering::Acquire);
+
             true
+        } else {
+            false
         }
     }
 
@@ -100,7 +100,6 @@ impl<'a> EventListener<'a> {
                 return false;
             }
 
-            black_box(i);
             spin_loop();
             i += 1;
         }
@@ -112,24 +111,33 @@ impl<'a> EventListener<'a> {
     /// Blocks the current thread. Returns when [`Event::notify`] has been
     /// called at least once since this object's creation.
     pub fn wait(&self) {
-        loop {
-            let (Ok(atomic) | Err(atomic)) = self.event.atomic.compare_exchange(
-                self.version,
-                self.version | Event::WAITER_FLAG,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+        let (Ok(atomic) | Err(atomic)) = self.event.atomic.compare_exchange(
+            self.version,
+            self.version | Event::WAITER_FLAG,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
 
-            if self.version == (atomic & !Event::WAITER_FLAG) {
+        if self.version == (atomic & !Event::WAITER_FLAG) {
+            loop {
                 self.event.atomic.wait(self.version | Event::WAITER_FLAG);
-            } else {
-                break;
+
+                if self.signaled_relaxed() {
+                    break;
+                }
             }
         }
 
         // Since the version incremented, memory writes from signaling threads
         // must be made visible to this thread.
         fence(Ordering::Acquire);
+    }
+
+    /// Whether [`Event::notify`] has been called at least once after this
+    /// object's creation.
+    fn signaled_relaxed(&self) -> bool {
+        let atomic = self.event.atomic.load(Ordering::Relaxed);
+        self.version != (atomic & !Event::WAITER_FLAG)
     }
 }
 

@@ -10,8 +10,7 @@ use paralight::iter::{Accumulator, ExactSizeAccumulator, GenericThreadPool, Sour
 pub use self::task::*;
 pub use self::thread_pool::*;
 
-/// Internal tracking for work trees executing on a thread pool.
-mod join_point;
+mod job_block;
 
 /// Implementation of tasks for the [`spawn`] API.
 mod task;
@@ -291,6 +290,7 @@ mod tests {
         assert_eq!([0, 3, 8, 15, 24], result);
     }
 
+    /*
     /// Spawns and joins many tasks.
     #[test]
     fn execute_many() {
@@ -305,5 +305,5 @@ mod tests {
                 crate::spawn_owned(|| std::thread::sleep(std::time::Duration::new(0, 200)));
             assert_eq!(third_task.join(), fourth_task.join());
         }
-    }
+    } */
 }

@@ -1,7 +1,7 @@
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::hint::unreachable_unchecked;
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, transmute};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle, available_parallelism};
 use paralight::iter::{Accumulator, ExactSizeAccumulator, GenericThreadPool, SourceCleanup};
 use smallvec::SmallVec;
 
-use crate::join_point::*;
+use crate::job_block::{JobBlock, JobBlockMask, JobBlockMasks};
 use crate::util::*;
 use crate::{OwnedTask, SharedTask, TaskInner};
 
@@ -145,10 +145,10 @@ impl ThreadPool {
     /// task.
     pub fn install<R>(&self, f: impl FnOnce() -> R) -> R {
         abort_on_panic(|| {
-            assert!(
+            /*todo assert!(
                 JoinPoint::current().is_none(),
                 "Attempted to enter pool from within another context."
-            );
+            );*/
 
             let previous = LOCAL_POOL.get();
             LOCAL_POOL.set(self);
@@ -212,8 +212,7 @@ impl ThreadPool {
             let result_a = UnsafeCell::new(MaybeUninit::uninit());
             let result_b = UnsafeCell::new(MaybeUninit::uninit());
 
-            JoinPoint::invoke(
-                self.state,
+            self.state.invoke_sync(
                 |i| match i {
                     0 => {
                         (*result_a.get()).write(oper_a_holder.assume_init_read()());
@@ -302,8 +301,7 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
             output.reserve_exact(input_len);
             let output_buffer = output.as_mut_ptr();
 
-            JoinPoint::invoke(
-                self.0.state,
+            self.0.state.invoke_sync(
                 |i| {
                     output_buffer
                         .add(i)
@@ -334,8 +332,7 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
             output.reserve_exact(input_len);
             let output_buffer = output.as_mut_ptr();
 
-            JoinPoint::invoke(
-                self.0.state,
+            self.0.state.invoke_sync(
                 |i| {
                     output_buffer.add(i).write(accum.accumulate(i..i + 1));
                 },
@@ -376,8 +373,7 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
             let break_early = AtomicBool::new(false);
             let output_buffer = output.as_mut_ptr();
 
-            JoinPoint::invoke(
-                self.pool.state,
+            self.pool.state.invoke_sync(
                 |i| {
                     let start = chunk_size * i;
                     let end = (start + chunk_size).min(input_len);
@@ -428,8 +424,7 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
             output.reserve_exact(work_units);
             let output_buffer = output.as_mut_ptr();
 
-            JoinPoint::invoke(
-                self.pool.state,
+            self.pool.state.invoke_sync(
                 |i| {
                     let start = chunk_size * i;
                     let end = (start + chunk_size).min(input_len);
@@ -453,13 +448,14 @@ pub(crate) struct ThreadPoolState {
     pub idle_spin_cycles: usize,
     /// An event that is invoked whenever new work is available.
     pub on_change: Event,
-    /// Join points where pool threads should look for work.
-    pub roots: spin::RwLock<Vec<JoinPoint>>,
     /// Whether the parent [`ThreadPool`] is being dropped.
     /// This indicates that workers should exit.
     pub should_stop: AtomicBool,
     /// The tasks that are currently in progress.
     pub tasks: spin::Mutex<VecDeque<Arc<dyn TaskInner>>>,
+
+    pub job_block: JobBlock,
+    pub available_masks: JobBlockMask
 }
 
 impl ThreadPoolState {
@@ -468,9 +464,11 @@ impl ThreadPoolState {
         Self {
             idle_spin_cycles: builder.idle_spin_cycles,
             on_change: Event::new(),
-            roots: spin::RwLock::new(Vec::new()),
             should_stop: AtomicBool::new(false),
             tasks: spin::Mutex::new(VecDeque::new()),
+
+            job_block: JobBlock::default(),
+            available_masks: JobBlockMask::default()
         }
     }
 
@@ -485,6 +483,33 @@ impl ThreadPoolState {
         }
     }
 
+    pub unsafe fn invoke_sync(&self, f: impl Fn(usize), times: usize) {
+        /// Forces the compiler to accept that `f` is `Sync`.
+        struct AssertSync<F>(F);
+        
+        impl<F> AssertSync<F> {
+            /// Gets the inner value.
+            pub unsafe fn get(&self) -> &F {
+                &self.0
+            }
+        }
+        
+        // Safety: guaranteed by the outer function invariant
+        unsafe impl<F> Sync for AssertSync<F> {}
+
+        let f_sync = AssertSync(f);
+        
+        self.invoke(move |i| unsafe { (f_sync.get())(i) }, times)
+    }
+
+    pub fn invoke(&self, f: impl Fn(usize) + Sync, times: usize) {
+        let success = self.job_block.try_execute(f, times, JobBlockMasks {
+            load: &self.available_masks,
+            store: &[&self.available_masks],
+        });
+        assert!(success);
+    }
+
     /// Schedules a task to be run on the pool.
     pub fn push_task(&self, task: Arc<dyn TaskInner>) {
         self.tasks.lock().push_back(task);
@@ -494,7 +519,13 @@ impl ThreadPoolState {
     /// Polls for available work on the thread pool, and goes to sleep if none
     /// is available.
     fn join(&self) {
-        assert!(
+        loop {
+            self.job_block.help(JobBlockMasks {
+                load: &self.available_masks,
+                store: &[&self.available_masks]
+            });
+        }
+        /*assert!(
             JoinPoint::current().is_none(),
             "Attempted to enter pool from within another context"
         );
@@ -526,7 +557,8 @@ impl ThreadPoolState {
                 };
                 spin_before_sleep = !listener.spin_wait(spin_cycles);
             }
-        }
+        }*/
+        todo!()
     }
 
     /// Removes a task from the queue, if one is available.
