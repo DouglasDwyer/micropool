@@ -15,6 +15,7 @@ pub fn index_of<T: PartialEq>(value: &T, slice: &[T]) -> Option<usize> {
 /// The primitive is reusable and will wake up all pending listeners each time
 /// it is signaled.
 #[derive(Debug, Default)]
+#[repr(align(64))]
 pub struct Event {
     /// The inner atomic representation of the event.
     /// Stores the version number in the lower bits.
@@ -112,24 +113,34 @@ impl<'a> EventListener<'a> {
     /// Blocks the current thread. Returns when [`Event::notify`] has been
     /// called at least once since this object's creation.
     pub fn wait(&self) {
-        loop {
-            let (Ok(atomic) | Err(atomic)) = self.event.atomic.compare_exchange(
-                self.version,
-                self.version | Event::WAITER_FLAG,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+        let span = tracy_client::span!("wait");
+        span.emit_color(0xa34337);
 
-            if self.version == (atomic & !Event::WAITER_FLAG) {
+        let (Ok(atomic) | Err(atomic)) = self.event.atomic.compare_exchange(
+            self.version,
+            self.version | Event::WAITER_FLAG,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+
+        if self.version == (atomic & !Event::WAITER_FLAG) {
+            loop {
+                let cspan = tracy_client::span!("call os");
+                cspan.emit_color(0xa34337);
                 self.event.atomic.wait(self.version | Event::WAITER_FLAG);
-            } else {
-                break;
-            }
-        }
+                drop(cspan);
 
-        // Since the version incremented, memory writes from signaling threads
-        // must be made visible to this thread.
-        fence(Ordering::Acquire);
+                let sspan = tracy_client::span!("atomic ld");
+                sspan.emit_color(0xa34337);
+                if self.signaled() {
+                    break;
+                }
+            }
+        } else {
+            // Since the version incremented, memory writes from signaling threads
+            // must be made visible to this thread.
+            fence(Ordering::Acquire);
+        }
     }
 }
 

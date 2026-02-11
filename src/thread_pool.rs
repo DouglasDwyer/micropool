@@ -632,12 +632,30 @@ impl WorkQueue {
     }
 
     fn register_and_invoke(this: &ScopedRef<Self>, f: impl Fn(usize), times: usize) {
+        let helper_func = |item: &WorkItem, first_unit: usize| {
+            let mut locally_completed = 1u64;
+            f(first_unit);
+
+            loop {
+                let next_unit = item.started_invocations.fetch_add(1, Ordering::Relaxed);
+                if next_unit < item.total_invocations {
+                    f(next_unit as usize);
+                    locally_completed += 1;
+                }
+                else {
+                    break;
+                }
+            }
+
+            locally_completed
+        };
+
         // Safety: it is always sound to create a pointer
         let func = unsafe {
             std::mem::transmute::<
-                *const (dyn Fn(usize) + '_),
-                *const (dyn Fn(usize) + 'static),
-            >(&f as *const dyn Fn(usize))
+                *const (dyn Fn(&WorkItem, usize) -> u64 + '_),
+                *const (dyn Fn(&WorkItem, usize) -> u64 + 'static),
+            >(&helper_func as *const dyn Fn(&WorkItem, usize) -> u64)
         };
 
         let item = WorkItem {
@@ -742,23 +760,7 @@ impl WorkQueue {
         //span.emit_value(first_unit as u64);
 
         let total_invocations = item.total_invocations;
-
-        let mut locally_completed = 1;
-        // Safety: the function is valid and has not been called with `first_unit` yet
-        unsafe { (*item.func)(first_unit); }
-
-        loop {
-            let next_unit = item.started_invocations.fetch_add(1, Ordering::Relaxed);
-            if next_unit < item.total_invocations {
-                // Safety: the function is valid and has not been called with `next_unit` yet
-                unsafe { (*item.func)(next_unit as usize) };
-                locally_completed += 1;
-            }
-            else {
-                break;
-            }
-        }
-
+        let locally_completed = unsafe { (*item.func)(&item, first_unit) };
         let now_finished = item.completed_invocations.fetch_add(locally_completed, Ordering::Release) + locally_completed;
         now_finished == total_invocations
     }
@@ -818,7 +820,7 @@ struct WorkItem {
     /// Whether the work item is still registered in the [`WorkQueueState::queue`].
     pub enqueued: AtomicBool,
     /// The function to invoke. Accepts the unit index as an argument.
-    pub func: *const (dyn 'static + Fn(usize)),
+    pub func: *const (dyn 'static + Fn(&WorkItem, usize) -> u64),
     /// The number of units that have started.
     pub started_invocations: AtomicU64,
     /// The total number of units to invoke.
