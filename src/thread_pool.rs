@@ -1,16 +1,19 @@
+#![allow(unused)]
+
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::hint::unreachable_unchecked;
+use std::iter::repeat_with;
 use std::mem::{MaybeUninit, transmute};
 use std::ops::ControlFlow;
+use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering, fence};
 use std::thread::{self, JoinHandle, available_parallelism};
 
 use paralight::iter::{Accumulator, ExactSizeAccumulator, GenericThreadPool, SourceCleanup};
 use smallvec::SmallVec;
 
-use crate::job_block::{JobBlock, JobBlockMask, JobBlockMasks};
 use crate::util::*;
 use crate::{OwnedTask, SharedTask, TaskInner};
 
@@ -31,7 +34,11 @@ pub struct ThreadPoolBuilder {
     /// Threads waiting for work will spin at least this many cycles before
     /// sleeping.
     idle_spin_cycles: usize,
+    /// The maximum supported number of concurrent jobs (created through parallel iterators or calls to [`ThreadPool::join`]).
+    /// By default, this is set to `8 * std::thread::available_parallelism()`.
+    max_jobs: usize,
     /// The number of threads to spawn.
+    /// By default, this is set to `std::thread::available_parallelism().saturating_sub(1).max(1)`.
     num_threads: usize,
     /// The function to use when spawning new threads.
     spawn_handler: Box<ThreadSpawnerFn>,
@@ -93,12 +100,14 @@ impl ThreadPoolBuilder {
 impl Default for ThreadPoolBuilder {
     fn default() -> Self {
         Self {
-            idle_spin_cycles: 150000,
-            num_threads: available_parallelism()
+            idle_spin_cycles: 0,// 3000,
+            max_jobs: 8 * available_parallelism().map(usize::from).unwrap_or(1),
+            /*num_threads: available_parallelism()
                 .map(usize::from)
                 .unwrap_or_default()
                 .saturating_sub(1)
-                .max(1),
+                .max(1),*/
+            num_threads: 1,
             spawn_handler: Box::new(|_, x| thread::spawn(x)),
         }
     }
@@ -115,7 +124,7 @@ pub struct ThreadPool {
     /// Handles for stopping the pool threads.
     join_handles: Vec<JoinHandle<()>>,
     /// The shared state for the threadpool.
-    state: &'static ThreadPoolState,
+    state: Arc<ThreadPoolState>,
 }
 
 impl ThreadPool {
@@ -125,11 +134,12 @@ impl ThreadPool {
 
     /// Initializes a new pool with `builder`.
     fn new(mut builder: ThreadPoolBuilder) -> Self {
-        let state = Box::leak(Box::new(ThreadPoolState::new(&builder)));
+        let state = Arc::new(ThreadPoolState::new(&builder));
 
         let mut join_handles = Vec::with_capacity(builder.num_threads);
         for i in 0..builder.num_threads {
-            join_handles.push((builder.spawn_handler)(i, Box::new(|| state.join())));
+            let state_cloned = state.clone();
+            join_handles.push((builder.spawn_handler)(i, Box::new(move || state_cloned.join())));
         }
 
         Self {
@@ -164,7 +174,7 @@ impl ThreadPool {
         &self,
         f: impl 'static + FnOnce() -> T + Send,
     ) -> OwnedTask<T> {
-        OwnedTask::spawn(self.state, f)
+        OwnedTask::spawn(&self.state, f)
     }
 
     /// Spawns a shared asynchronous task on the global thread pool.
@@ -173,7 +183,7 @@ impl ThreadPool {
         &self,
         f: impl 'static + FnOnce() -> T + Send,
     ) -> SharedTask<T> {
-        SharedTask::spawn(self.state, f)
+        SharedTask::spawn(&self.state, f)
     }
 
     /// Executes `f` within the context of the current thread pool.
@@ -212,7 +222,7 @@ impl ThreadPool {
             let result_a = UnsafeCell::new(MaybeUninit::uninit());
             let result_b = UnsafeCell::new(MaybeUninit::uninit());
 
-            self.state.invoke_sync(
+            self.state.invoke_sync_unchecked(
                 |i| match i {
                     0 => {
                         (*result_a.get()).write(oper_a_holder.assume_init_read()());
@@ -301,7 +311,7 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
             output.reserve_exact(input_len);
             let output_buffer = output.as_mut_ptr();
 
-            self.0.state.invoke_sync(
+            self.0.state.invoke_sync_unchecked(
                 |i| {
                     output_buffer
                         .add(i)
@@ -332,7 +342,7 @@ unsafe impl<'a> GenericThreadPool for SplitPerItem<'a> {
             output.reserve_exact(input_len);
             let output_buffer = output.as_mut_ptr();
 
-            self.0.state.invoke_sync(
+            self.0.state.invoke_sync_unchecked(
                 |i| {
                     output_buffer.add(i).write(accum.accumulate(i..i + 1));
                 },
@@ -373,7 +383,7 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
             let break_early = AtomicBool::new(false);
             let output_buffer = output.as_mut_ptr();
 
-            self.pool.state.invoke_sync(
+            self.pool.state.invoke_sync_unchecked(
                 |i| {
                     let start = chunk_size * i;
                     let end = (start + chunk_size).min(input_len);
@@ -424,7 +434,7 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
             output.reserve_exact(work_units);
             let output_buffer = output.as_mut_ptr();
 
-            self.pool.state.invoke_sync(
+            self.pool.state.invoke_sync_unchecked(
                 |i| {
                     let start = chunk_size * i;
                     let end = (start + chunk_size).min(input_len);
@@ -441,34 +451,39 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
 
 /// Stores the inner state for a [`ThreadPool`] and coordinates work across
 /// multiple threads.
-#[derive(Default)]
 pub(crate) struct ThreadPoolState {
     /// Threads waiting for work will spin for at least this many cycles before
     /// sleeping.
     pub idle_spin_cycles: usize,
+    pub global_advertise_mask: AtomicBits,
+    /// Shared information about scheduled jobs. Threads reserve slots in this array
+    /// using the [`Self::running_jobs`] member. Other threads can then search this
+    /// array to look for work.
+    pub jobs: Vec<JobSlot>,
     /// An event that is invoked whenever new work is available.
     pub on_change: Event,
+    pub running_jobs: AtomicBits,
     /// Whether the parent [`ThreadPool`] is being dropped.
     /// This indicates that workers should exit.
     pub should_stop: AtomicBool,
     /// The tasks that are currently in progress.
     pub tasks: spin::Mutex<VecDeque<Arc<dyn TaskInner>>>,
-
-    pub job_block: JobBlock,
-    pub available_masks: JobBlockMask
 }
 
 impl ThreadPoolState {
     /// Creates a new state object.
     pub fn new(builder: &ThreadPoolBuilder) -> Self {
+        let global_advertise_mask = AtomicBits::new(builder.max_jobs);
+        let running_jobs = AtomicBits::new(builder.max_jobs);
+
         Self {
+            global_advertise_mask,
             idle_spin_cycles: builder.idle_spin_cycles,
+            jobs: repeat_with(JobSlot::default).take(running_jobs.len()).collect(),
             on_change: Event::new(),
+            running_jobs,
             should_stop: AtomicBool::new(false),
             tasks: spin::Mutex::new(VecDeque::new()),
-
-            job_block: JobBlock::default(),
-            available_masks: JobBlockMask::default()
         }
     }
 
@@ -483,7 +498,7 @@ impl ThreadPoolState {
         }
     }
 
-    pub unsafe fn invoke_sync(&self, f: impl Fn(usize), times: usize) {
+    pub unsafe fn invoke_sync_unchecked(&self, f: impl Fn(usize), times: usize) {
         /// Forces the compiler to accept that `f` is `Sync`.
         struct AssertSync<F>(F);
         
@@ -503,11 +518,81 @@ impl ThreadPoolState {
     }
 
     pub fn invoke(&self, f: impl Fn(usize) + Sync, times: usize) {
-        let success = self.job_block.try_execute(f, times, JobBlockMasks {
-            load: &self.available_masks,
-            store: &[&self.available_masks],
-        });
-        assert!(success);
+        match times {
+            0 => {},
+            1 => f(0),
+            _ => if let Some(index) = self.reserve_job_slot() {
+                let func = Self::create_job_func(f);
+                let slot = &self.jobs[index];
+                let times = times as i64;
+
+                let advertise_masks = [&self.global_advertise_mask];
+                let search_mask = &self.global_advertise_mask;
+
+                let descriptor = JobDescriptor {
+                    clear_masks: &advertise_masks,
+                    func: &func,
+                    incomplete_units: AtomicI64::new(times),
+                    search_mask
+                };
+
+                // Safety: the slot has been reserved but the job count is not yet published,
+                // so no other threads will be reading the descriptor.
+                unsafe { *slot.descriptor.get() = &descriptor as *const _ as *const _ };
+
+                // Release ordering: the descriptor that was written must be made visible to other threads
+                slot.available_units.store(times - 1, Ordering::SeqCst);
+
+                for mask in &advertise_masks {
+                    mask.set(index, true, Ordering::SeqCst);
+                }
+
+                // Notify other threads of available work
+                self.on_change.notify();
+
+                let locally_completed = func(JobInvocation {
+                    available_units: &slot.available_units,
+                    clear_masks: &advertise_masks,
+                    reserved_unit: times - 1,
+                    slot: index
+                });
+
+                if locally_completed < times {
+                    let mut spin_before_sleep = true;
+                    let mut listener = self.on_change.listen();
+
+                    let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::SeqCst) - locally_completed;
+
+                    if 0 < remaining {
+                        while 0 < descriptor.incomplete_units.load(Ordering::SeqCst) {
+                            if self.help_one_job(search_mask) {
+                                spin_before_sleep = true;
+                            }
+                            else {
+                                // Only spin if something was found to do since the last sleep
+                                let spin_cycles = if spin_before_sleep {
+                                    self.idle_spin_cycles
+                                } else {
+                                    0
+                                };
+
+                                spin_before_sleep = !listener.spin_wait(spin_cycles);
+                            }
+                        }
+                    }
+
+                    fence(Ordering::SeqCst);
+                }
+
+                self.release_job_slot(index);
+            }
+            else {
+                // No job slot available - perform the work without parallelism
+                for i in 0..times {
+                    f(i);
+                }
+            }
+        }
     }
 
     /// Schedules a task to be run on the pool.
@@ -519,35 +604,18 @@ impl ThreadPoolState {
     /// Polls for available work on the thread pool, and goes to sleep if none
     /// is available.
     fn join(&self) {
-        loop {
-            self.job_block.help(JobBlockMasks {
-                load: &self.available_masks,
-                store: &[&self.available_masks]
-            });
-        }
-        /*assert!(
-            JoinPoint::current().is_none(),
-            "Attempted to enter pool from within another context"
-        );
-
+        let mut listener = self.on_change.listen();
         let mut spin_before_sleep = false;
 
         loop {
-            let listener = self.on_change.listen();
-            let item = JoinPoint::select_work_unit_from(&self.roots.read());
-
-            if let Some((point, i)) = item {
+            if self.help_global_jobs() {
                 spin_before_sleep = true;
-                JoinPoint::set_current(Some(point.clone()));
-                unsafe {
-                    point.invoke_work_unit(i);
-                }
-                point.help();
-                JoinPoint::set_current(None);
-            } else if self.should_stop.load(Ordering::Relaxed) {
+            } else if self.should_stop.load(Ordering::SeqCst) {
                 return;
             } else if let Some(task) = self.pop_task() {
-                JoinPoint::join_task(&*task, true);
+                //JoinPoint::join_task(&*task, true);
+                task.run();
+                spin_before_sleep = true;
             } else {
                 // Only spin if something was found to do since the last sleep
                 let spin_cycles = if spin_before_sleep {
@@ -557,15 +625,259 @@ impl ThreadPoolState {
                 };
                 spin_before_sleep = !listener.spin_wait(spin_cycles);
             }
-        }*/
-        todo!()
+        }
     }
 
     /// Removes a task from the queue, if one is available.
     fn pop_task(&self) -> Option<Arc<dyn TaskInner>> {
         self.tasks.lock().pop_front()
     }
+
+    fn help_global_jobs(&self) -> bool {
+        let mut ran_item = false;
+        
+        while self.help_one_job(&self.global_advertise_mask) {
+            ran_item = true;
+        }
+
+        ran_item
+    }
+
+    fn help_one_job(&self, search_mask: &AtomicBits) -> bool {
+        for index in search_mask.iter_ones() {
+            let slot = &self.jobs[index];
+            let reserved_unit = slot.available_units.fetch_sub(1, Ordering::SeqCst) - 1;
+
+            if reserved_unit < 0 {
+                continue;
+            }
+            else {
+                // Safety: we were able to reserve a work unit, so the job is valid
+                // and will remain so until the unit is processed.
+                let descriptor = unsafe { &*slot.descriptor.get().read().cast::<JobDescriptor>() };
+
+                if !std::ptr::eq(descriptor.search_mask, search_mask) {
+                    // The work unit corresponds to some other search set now. Cancel this task
+                    slot.available_units.fetch_add(1, Ordering::Relaxed);
+                    self.on_change.notify();
+                    continue;
+                }
+
+                // todo: set search mask (if worker)
+
+                let locally_completed = (descriptor.func)(JobInvocation {
+                    available_units: &slot.available_units,
+                    clear_masks: descriptor.clear_masks,
+                    reserved_unit,
+                    slot: index
+                });
+
+                // todo: set search mask (if worker)
+
+                // Release ordering: the parallelized results must be made visible to the original thread
+                let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::SeqCst) - locally_completed;
+                
+                if remaining == 0 {
+                    self.on_change.notify();
+                }
+
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn release_job_slot(&self, index: usize) {
+        // Release ordering: now that we are finished using the job slot,
+        // we need to guarantee that any memory operations on it are visible.
+        self.running_jobs.set(index, false, Ordering::SeqCst);
+    }
+
+    fn reserve_job_slot(&self) -> Option<usize> {
+        for index in self.running_jobs.iter_zeroes() {
+            if !self.running_jobs.set(index, true, Ordering::SeqCst) {
+                // Acquire ordering: now that the job slot is reserved, we need to
+                // guarantee that any previous operations using the same slot have finished.
+                fence(Ordering::SeqCst);
+                return Some(index);
+            }
+        }
+
+        None
+    }
+
+    fn create_job_func(f: impl Fn(usize) + Sync) -> impl Fn(JobInvocation) -> i64 {
+        move |invocation| {
+            let mut locally_completed = 0;
+            let mut next_unit = invocation.reserved_unit;
+
+            loop {
+                if next_unit < 0 {
+                    break;
+                }
+                else if next_unit == 0 {
+                    for mask in invocation.clear_masks {
+                        mask.set(invocation.slot, false, Ordering::SeqCst);
+                    }
+                }
+                
+                f(next_unit as usize);
+                locally_completed += 1;
+
+                next_unit = invocation.available_units.fetch_sub(1, Ordering::SeqCst) - 1;
+            }
+
+            locally_completed as i64
+        }
+    }
 }
 
 unsafe impl Send for ThreadPoolState {}
 unsafe impl Sync for ThreadPoolState {}
+
+#[derive(Debug, Default)]
+struct JobSlot {
+    available_units: AtomicI64,
+    descriptor: UnsafeCell<*const ()>
+}
+
+struct JobDescriptor<'a> {
+    clear_masks: &'a [&'a AtomicBits],
+    func: &'a dyn Fn(JobInvocation) -> i64,
+    incomplete_units: AtomicI64,
+    search_mask: &'a AtomicBits,
+}
+
+#[derive(Debug)]
+struct JobInvocation<'a> {
+    available_units: &'a AtomicI64,
+    clear_masks: &'a [&'a AtomicBits],
+    reserved_unit: i64,
+    slot: usize
+}
+
+/// Holds a shared array of `bool`s. Each value is atomically modifiable.
+#[derive(Clone, Debug)]
+struct AtomicBits(Arc<[AtomicU64]>);
+
+impl AtomicBits {
+    /// The number of bits per [`AtomicU64`] in the backing array.
+    const ELEMENT_BITS: usize = u64::BITS as usize;
+
+    /// Creates a new bit array that can store at least `capacity` values.
+    /// The actual length of the array may be larger.
+    pub fn new(capacity: usize) -> Self {
+        let elements = capacity.div_ceil(Self::ELEMENT_BITS);
+        Self(repeat_with(AtomicU64::default).take(elements).collect())
+    }
+
+    /// Loads the value of the bit at `index`.
+    /// Valid atomic orderings are [`Ordering::SeqCst`],
+    /// [`Ordering::Acquire`], and [`Ordering::Relaxed`].
+    pub fn get(&self, index: usize, order: Ordering) -> bool {
+        let (element, bit) = Self::element_bit(index);
+        let mask = 1 << bit;
+
+        (self.0[element].load(order) & mask) != 0
+    }
+
+    /// Returns `true` if there are no values in this array.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns an iterator over all `true` values in the array.
+    /// This is always an [`Ordering::Relaxed`] operation, since
+    /// different parts of the array may be loaded at different times.
+    pub fn iter_ones(&self) -> impl Iterator<Item = usize> {
+        AtomicBitsIter {
+            base_index: 0,
+            bits: self,
+            current_value: 0,
+            invert_mask: 0,
+            next_element: 0
+        }
+    }
+
+    /// The number of bits in the array.
+    pub fn len(&self) -> usize {
+        Self::ELEMENT_BITS * self.0.len()
+    }
+
+    /// Returns an iterator over all `true` values in the array.
+    /// This is always an [`Ordering::Relaxed`] operation, since
+    /// different parts of the array may be loaded at different times.
+    pub fn iter_zeroes(&self) -> impl Iterator<Item = usize> {
+        AtomicBitsIter {
+            base_index: 0,
+            bits: self,
+            current_value: 0,
+            invert_mask: u64::MAX,
+            next_element: 0
+        }
+    }
+
+    /// Sets the value of the bit at `index`. Returns the previous value.
+    /// All atomic orderings are possible.
+    pub fn set(&self, index: usize, value: bool, order: Ordering) -> bool {
+        let (element, bit) = Self::element_bit(index);
+        let mask = 1 << bit;
+        let element = &self.0[element];
+
+        let previous = if value {
+            element.fetch_or(mask, order)
+        }
+        else {
+            element.fetch_and(!mask, order)
+        };
+
+        (previous & mask) != 0
+    }
+
+    /// Decomposes `index` into two parts:
+    /// 
+    /// - The location of the [`AtomicU64`] within the backing array
+    /// - The location of the bit within that number
+    fn element_bit(index: usize) -> (usize, usize) {
+        (index / Self::ELEMENT_BITS, index % Self::ELEMENT_BITS)
+    }
+}
+
+/// Enumerates the indices of `true` values or `false` values in an [`AtomicBits`] array.
+struct AtomicBitsIter<'a> {
+    /// The overall index of the starting bit in [`Self::current_value`].
+    base_index: usize,
+    /// The array from which to load data.
+    bits: &'a AtomicBits,
+    /// The current group of values that was loaded.
+    current_value: u64,
+    /// If set to `0`, then this iterates over all `true` values in the array.
+    /// If set to [`u64::MAX`], then this iterates over all `false` values.
+    invert_mask: u64,
+    /// The next element to load from the underlying [`AtomicU64`] array.
+    next_element: usize,
+}
+
+impl Iterator for AtomicBitsIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current_value == 0 {
+            if self.next_element < self.bits.0.len() {
+                let element = self.bits.0[self.next_element].load(Ordering::SeqCst);
+                self.current_value = element ^ self.invert_mask;
+
+                self.base_index = AtomicBits::ELEMENT_BITS * self.next_element;
+                self.next_element += 1;
+            }
+            else {
+                return None;
+            }
+        }
+        
+        let bit = self.current_value.trailing_zeros();
+        self.current_value &= (u64::MAX << 1) << bit;
+        Some(self.base_index + bit as usize)
+    }
+}

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use takecell::TakeOwnCell;
 
@@ -11,12 +11,12 @@ impl<T: 'static + Send> OwnedTask<T> {
     /// Spawns a new task on the given pool.
     #[inline(always)]
     pub(crate) fn spawn(
-        pool: &'static ThreadPoolState,
+        pool: &Arc<ThreadPoolState>,
         f: impl 'static + FnOnce() -> T + Send,
     ) -> Self {
         let inner = Arc::new(TypedTaskInner {
             func: TakeOwnCell::new(Box::new(|| TakeOwnCell::new(f()))),
-            pool,
+            pool: Arc::downgrade(pool),
             result: spin::Once::new(),
         });
 
@@ -28,7 +28,9 @@ impl<T: 'static + Send> OwnedTask<T> {
     /// Cancels this task, preventing it from running if it was not yet started.
     #[inline(always)]
     pub fn cancel(self) {
-        self.0.pool.cancel_task(&self.0);
+        if let Some(pool) = self.0.pool.upgrade() {
+            pool.cancel_task(&self.0);
+        }
     }
 
     /// Whether the task has been completed yet.
@@ -84,12 +86,12 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
     /// Spawns a new task on the given pool.
     #[inline(always)]
     pub(crate) fn spawn(
-        pool: &'static ThreadPoolState,
+        pool: &Arc<ThreadPoolState>,
         f: impl 'static + FnOnce() -> T + Send,
     ) -> Self {
         let inner = Arc::new(TypedTaskInner {
             func: TakeOwnCell::new(Box::new(f)),
-            pool,
+            pool: Arc::downgrade(pool),
             result: spin::Once::new(),
         });
 
@@ -111,8 +113,9 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
         // If the task has been removed from the queue, then the `strong_count` may be
         // less than three, but in that case `cancel_task` is a no-op. So, this
         // is correct.
-        if Arc::strong_count(&self.0) < 3 {
-            self.0.pool.cancel_task(&self.0);
+        if Arc::strong_count(&self.0) < 3
+            && let Some(pool) = self.0.pool.upgrade() {
+            pool.cancel_task(&self.0);
         }
     }
 
@@ -175,7 +178,7 @@ struct TypedTaskInner<T: Send + Sync> {
     /// The function to invoke.
     func: TakeOwnCell<Box<dyn FnOnce() -> T + Send>>,
     /// The thread pool on which this work is spawned.
-    pool: &'static ThreadPoolState,
+    pool: Weak<ThreadPoolState>,
     /// The result of the task, if any.
     result: spin::Once<T>,
 }

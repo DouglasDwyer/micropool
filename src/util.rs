@@ -43,12 +43,7 @@ impl Event {
         let new_value = atomic + 1;
 
         if (atomic & Self::WAITER_FLAG) != 0 {
-            let _ = self.atomic.compare_exchange(
-                new_value,
-                new_value & !Event::WAITER_FLAG,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+            self.atomic.fetch_and(!Event::WAITER_FLAG, Ordering::Relaxed);
             self.atomic.notify_all();
         }
     }
@@ -75,28 +70,14 @@ pub struct EventListener<'a> {
 }
 
 impl<'a> EventListener<'a> {
-    /// Whether [`Event::notify`] has been called at least once after this
-    /// object's creation.
-    pub fn signaled(&self) -> bool {
-        if self.signaled_relaxed() {
-            // Since the version incremented, memory writes from signaling threads
-            // must be made visible to this thread.
-            fence(Ordering::Acquire);
-
-            true
-        } else {
-            false
-        }
-    }
-
     /// Blocks the current thread, spinning in a loop for `cycles` before
     /// falling back to blocking with the operating system scheduler.
     /// Returns `true` only if the thread was put to sleep by the operating
     /// system.
-    pub fn spin_wait(&self, cycles: usize) -> bool {
+    pub fn spin_wait(&mut self, cycles: usize) -> bool {
         let mut i = 0;
         while i < cycles {
-            if self.signaled() {
+            if self.read_new_version(self.event.atomic.load(Ordering::Relaxed)) {
                 return false;
             }
 
@@ -109,8 +90,8 @@ impl<'a> EventListener<'a> {
     }
 
     /// Blocks the current thread. Returns when [`Event::notify`] has been
-    /// called at least once since this object's creation.
-    pub fn wait(&self) {
+    /// called at least once since the previous call to [`Self::wait`] (or this listener's creation).
+    pub fn wait(&mut self) {
         let (Ok(atomic) | Err(atomic)) = self.event.atomic.compare_exchange(
             self.version,
             self.version | Event::WAITER_FLAG,
@@ -118,26 +99,34 @@ impl<'a> EventListener<'a> {
             Ordering::Relaxed,
         );
 
-        if self.version == (atomic & !Event::WAITER_FLAG) {
+        if !self.read_new_version(atomic) {
             loop {
                 self.event.atomic.wait(self.version | Event::WAITER_FLAG);
 
-                if self.signaled_relaxed() {
+                if self.read_new_version(self.event.atomic.load(Ordering::Relaxed)) {
                     break;
                 }
             }
         }
-
-        // Since the version incremented, memory writes from signaling threads
-        // must be made visible to this thread.
-        fence(Ordering::Acquire);
     }
 
-    /// Whether [`Event::notify`] has been called at least once after this
-    /// object's creation.
-    fn signaled_relaxed(&self) -> bool {
-        let atomic = self.event.atomic.load(Ordering::Relaxed);
-        self.version != (atomic & !Event::WAITER_FLAG)
+    /// Checks to see whether the listener was signaled based upon the value of `atomic`.
+    /// If so, updates the internal version counter (so that [`Self::wait`] can be called again).
+    fn read_new_version(&mut self, atomic: u64) -> bool {
+        let new_version = atomic & !Event::WAITER_FLAG;
+        
+        if self.version != new_version {
+            // Since the version incremented, memory writes from signaling threads
+            // must be made visible to this thread. Additionally, we must guarantee
+            // a happens-before relationship between this call and all subsequent code.
+            fence(Ordering::SeqCst);
+
+            self.version = new_version;            
+            true
+        }
+        else {
+            false
+        }
     }
 }
 
@@ -158,78 +147,4 @@ pub fn abort_on_panic<R, F: FnOnce() -> R>(f: F) -> R {
 
     let _guard = PanicGuard;
     f()
-}
-
-/// Allows for erasing lifetimes and sharing references on the stack.
-pub struct ScopedRef<T>(NonNull<ScopedHolder<T>>);
-
-impl<T> ScopedRef<T> {
-    /// Wraps `value` in a [`ScopedRef`], which is provided to `scope`.
-    /// Once `scope` completes, this function will block until all
-    /// clones of the reference are dropped.
-    pub fn of<R>(value: T, scope: impl FnOnce(Self) -> R) -> R {
-        let holder = ScopedHolder {
-            ref_count: AtomicUsize::new(1),
-            value,
-        };
-        let _dropper = ScopedHolderDropper(&holder);
-        scope(ScopedRef(NonNull::from_ref(&holder)))
-    }
-
-    /// Determines whether two scoped references refer to the same underlying
-    /// object.
-    pub fn ptr_eq(lhs: &Self, rhs: &Self) -> bool {
-        lhs.0 == rhs.0
-    }
-}
-
-impl<T> Clone for ScopedRef<T> {
-    fn clone(&self) -> Self {
-        unsafe {
-            self.0.as_ref().ref_count.fetch_add(1, Ordering::Relaxed);
-            Self(self.0)
-        }
-    }
-}
-
-impl<T> Deref for ScopedRef<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &self.0.as_ref().value }
-    }
-}
-
-impl<T> Drop for ScopedRef<T> {
-    fn drop(&mut self) {
-        unsafe {
-            self.0.as_ref().ref_count.fetch_sub(1, Ordering::Release);
-        }
-    }
-}
-
-unsafe impl<T: Send + Sync> Send for ScopedRef<T> {}
-unsafe impl<T: Send + Sync> Sync for ScopedRef<T> {}
-
-/// Stores the inner state for a [`ScopedRef`].
-struct ScopedHolder<T> {
-    /// The number of active references to this holder.
-    ref_count: AtomicUsize,
-    /// The underlying value.
-    value: T,
-}
-
-/// Ensures that [`ScopedHolder`] is not freed until all references
-/// to it are dropped.
-struct ScopedHolderDropper<'a, T>(&'a ScopedHolder<T>);
-
-impl<T> Drop for ScopedHolderDropper<'_, T> {
-    fn drop(&mut self) {
-        while 0 < self.0.ref_count.load(Ordering::Relaxed) {
-            spin_loop();
-        }
-
-        // Synchronize memory access with other threads before deleting the object
-        fence(Ordering::Acquire);
-    }
 }
