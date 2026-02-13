@@ -5,12 +5,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::thread::{self};
 use wait_on_address::AtomicWait;
 
-/// Gets the first index of `value` within `slice`, or returns [`None`] if
-/// it was not found.
-pub fn index_of<T: PartialEq>(value: &T, slice: &[T]) -> Option<usize> {
-    slice.iter().position(|x| x == value)
-}
-
 /// A synchronization primitive for blocking threads until an event occurs.
 /// The primitive is reusable and will wake up all pending listeners each time
 /// it is signaled.

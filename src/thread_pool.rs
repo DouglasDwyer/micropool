@@ -100,14 +100,13 @@ impl ThreadPoolBuilder {
 impl Default for ThreadPoolBuilder {
     fn default() -> Self {
         Self {
-            idle_spin_cycles: 0,// 3000,
+            idle_spin_cycles: 3000,
             max_jobs: 8 * available_parallelism().map(usize::from).unwrap_or(1),
-            /*num_threads: available_parallelism()
+            num_threads: available_parallelism()
                 .map(usize::from)
                 .unwrap_or_default()
                 .saturating_sub(1)
-                .max(1),*/
-            num_threads: 1,
+                .max(1),
             spawn_handler: Box::new(|_, x| thread::spawn(x)),
         }
     }
@@ -540,11 +539,11 @@ impl ThreadPoolState {
                 // so no other threads will be reading the descriptor.
                 unsafe { *slot.descriptor.get() = &descriptor as *const _ as *const _ };
 
-                // Release ordering: the descriptor that was written must be made visible to other threads
-                slot.available_units.store(times - 1, Ordering::SeqCst);
+                // The descriptor that was written must be made visible to other threads
+                slot.available_units.store(times - 1, Ordering::Release);
 
                 for mask in &advertise_masks {
-                    mask.set(index, true, Ordering::SeqCst);
+                    mask.set(index, true, Ordering::Relaxed);
                 }
 
                 // Notify other threads of available work
@@ -561,10 +560,10 @@ impl ThreadPoolState {
                     let mut spin_before_sleep = true;
                     let mut listener = self.on_change.listen();
 
-                    let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::SeqCst) - locally_completed;
+                    let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::Relaxed) - locally_completed;
 
                     if 0 < remaining {
-                        while 0 < descriptor.incomplete_units.load(Ordering::SeqCst) {
+                        while 0 < descriptor.incomplete_units.load(Ordering::Relaxed) {
                             if self.help_one_job(search_mask) {
                                 spin_before_sleep = true;
                             }
@@ -581,7 +580,7 @@ impl ThreadPoolState {
                         }
                     }
 
-                    fence(Ordering::SeqCst);
+                    fence(Ordering::Acquire);
                 }
 
                 self.release_job_slot(index);
@@ -610,7 +609,7 @@ impl ThreadPoolState {
         loop {
             if self.help_global_jobs() {
                 spin_before_sleep = true;
-            } else if self.should_stop.load(Ordering::SeqCst) {
+            } else if self.should_stop.load(Ordering::Relaxed) {
                 return;
             } else if let Some(task) = self.pop_task() {
                 //JoinPoint::join_task(&*task, true);
@@ -646,7 +645,7 @@ impl ThreadPoolState {
     fn help_one_job(&self, search_mask: &AtomicBits) -> bool {
         for index in search_mask.iter_ones() {
             let slot = &self.jobs[index];
-            let reserved_unit = slot.available_units.fetch_sub(1, Ordering::SeqCst) - 1;
+            let reserved_unit = slot.available_units.fetch_sub(1, Ordering::Relaxed) - 1;
 
             if reserved_unit < 0 {
                 continue;
@@ -674,8 +673,8 @@ impl ThreadPoolState {
 
                 // todo: set search mask (if worker)
 
-                // Release ordering: the parallelized results must be made visible to the original thread
-                let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::SeqCst) - locally_completed;
+                // The parallelized results must be made visible to the original thread
+                let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::Release) - locally_completed;
                 
                 if remaining == 0 {
                     self.on_change.notify();
@@ -691,15 +690,15 @@ impl ThreadPoolState {
     fn release_job_slot(&self, index: usize) {
         // Release ordering: now that we are finished using the job slot,
         // we need to guarantee that any memory operations on it are visible.
-        self.running_jobs.set(index, false, Ordering::SeqCst);
+        self.running_jobs.set(index, false, Ordering::Release);
     }
 
     fn reserve_job_slot(&self) -> Option<usize> {
         for index in self.running_jobs.iter_zeroes() {
-            if !self.running_jobs.set(index, true, Ordering::SeqCst) {
+            if !self.running_jobs.set(index, true, Ordering::Relaxed) {
                 // Acquire ordering: now that the job slot is reserved, we need to
                 // guarantee that any previous operations using the same slot have finished.
-                fence(Ordering::SeqCst);
+                fence(Ordering::Acquire);
                 return Some(index);
             }
         }
@@ -718,14 +717,14 @@ impl ThreadPoolState {
                 }
                 else if next_unit == 0 {
                     for mask in invocation.clear_masks {
-                        mask.set(invocation.slot, false, Ordering::SeqCst);
+                        mask.set(invocation.slot, false, Ordering::Relaxed);
                     }
                 }
                 
                 f(next_unit as usize);
                 locally_completed += 1;
 
-                next_unit = invocation.available_units.fetch_sub(1, Ordering::SeqCst) - 1;
+                next_unit = invocation.available_units.fetch_sub(1, Ordering::Relaxed) - 1;
             }
 
             locally_completed as i64
@@ -865,7 +864,7 @@ impl Iterator for AtomicBitsIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         while self.current_value == 0 {
             if self.next_element < self.bits.0.len() {
-                let element = self.bits.0[self.next_element].load(Ordering::SeqCst);
+                let element = self.bits.0[self.next_element].load(Ordering::Relaxed);
                 self.current_value = element ^ self.invert_mask;
 
                 self.base_index = AtomicBits::ELEMENT_BITS * self.next_element;
