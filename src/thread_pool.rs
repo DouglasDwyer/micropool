@@ -680,6 +680,9 @@ impl ThreadPoolState {
                 continue;
             }
             else {
+                // The job descriptor must be made visible to this thread
+                fence(Ordering::Acquire);
+
                 // Safety: we were able to reserve a work unit, so the job is valid
                 // and will remain so until the unit is processed.
                 let descriptor = unsafe { &*slot.descriptor.get().read().cast::<JobDescriptor>() };
