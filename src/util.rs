@@ -1,7 +1,5 @@
 use std::hint::{spin_loop};
-use std::ops::Deref;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::thread::{self};
 use wait_on_address::AtomicWait;
 
@@ -34,8 +32,6 @@ impl Event {
     /// all preceeding code and all subsequent calls to [`Self::listen`].
     pub fn notify(&self) {
         let atomic = self.atomic.fetch_add(1, Ordering::SeqCst);
-        let new_value = atomic + 1;
-
         if (atomic & Self::WAITER_FLAG) != 0 {
             self.atomic.fetch_and(!Event::WAITER_FLAG, Ordering::Relaxed);
             self.atomic.notify_all();

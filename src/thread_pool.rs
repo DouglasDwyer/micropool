@@ -21,8 +21,17 @@ use crate::{OwnedTask, SharedTask, TaskInner};
 static GLOBAL_POOL: spin::Once<ThreadPool> = spin::Once::new();
 
 thread_local! {
+    /// A mask related to the top-level work item being executed by this thread.
+    /// This mask is used to restrict which jobs get taken during work-stealing.
+    /// This prevents external threads from taking each other's work
+    /// (which would increase latency).
+    static LOCAL_ADVERTISE_MASK: Cell<*const AtomicBits> = const { Cell::new(std::ptr::null()) };
+
     /// The thread pool that is locally active due to [`ThreadPool::install`].
     static LOCAL_POOL: Cell<*const ThreadPool> = const { Cell::new(std::ptr::null()) };
+
+    /// todo
+    static ADVERTISE_MASK_STORE: UnsafeCell<AtomicBits> = UnsafeCell::new(AtomicBits::default());
 }
 
 /// The function signature for the [`ThreadPoolBuilder::spawn_handler`]
@@ -120,8 +129,9 @@ impl Default for ThreadPoolBuilder {
 /// [`ThreadPool::install()`]. By contrast, top-level functions
 /// (like `join()`) will execute implicitly within the current thread pool.
 pub struct ThreadPool {
-    /// Handles for stopping the pool threads.
-    join_handles: Vec<JoinHandle<()>>,
+    /// Handles for stopping the pool threads (if this is an owned pool),
+    /// or [`None`] (if this is a pool referenced by a worker).
+    join_handles: Option<Vec<JoinHandle<()>>>,
     /// The shared state for the threadpool.
     state: Arc<ThreadPoolState>,
 }
@@ -138,31 +148,32 @@ impl ThreadPool {
         let mut join_handles = Vec::with_capacity(builder.num_threads);
         for i in 0..builder.num_threads {
             let state_cloned = state.clone();
-            join_handles.push((builder.spawn_handler)(i, Box::new(move || state_cloned.join())));
+            join_handles.push((builder.spawn_handler)(i, Box::new(move || {
+                let thread_pool = Self { join_handles: None, state: state_cloned };
+                LOCAL_POOL.set(&thread_pool);
+                thread_pool.state.join()
+            })));
         }
 
         Self {
-            join_handles,
+            join_handles: Some(join_handles),
             state,
         }
     }
 
     /// Changes the current context to this thread pool. Any attempts to use
     /// [`crate::join`] or parallel iterators will operate within this pool.
-    ///
-    /// Panics if called from within a parallel iterator or other asynchronous
-    /// task.
+    /// Panics if called recursively.
     pub fn install<R>(&self, f: impl FnOnce() -> R) -> R {
         abort_on_panic(|| {
-            /*todo assert!(
-                JoinPoint::current().is_none(),
-                "Attempted to enter pool from within another context."
-            );*/
-
-            let previous = LOCAL_POOL.get();
+            assert!(
+                LOCAL_POOL.get().is_null(),
+                "cannot call install recursively"
+            );
+            
             LOCAL_POOL.set(self);
             let result = f();
-            LOCAL_POOL.set(previous);
+            LOCAL_POOL.set(std::ptr::null());
             result
         })
     }
@@ -188,21 +199,25 @@ impl ThreadPool {
     /// Executes `f` within the context of the current thread pool.
     /// Initializes the global thread pool if no other pool is active.
     pub(crate) fn with_current<R>(f: impl FnOnce(&ThreadPool) -> R) -> R {
-        unsafe {
+        abort_on_panic(|| unsafe {
             let mut pool_ptr = LOCAL_POOL.get();
 
             if pool_ptr.is_null() {
                 pool_ptr = GLOBAL_POOL.call_once(|| ThreadPoolBuilder::default().build());
                 LOCAL_POOL.set(pool_ptr);
+                let result = f(&*pool_ptr);
+                LOCAL_POOL.set(std::ptr::null());
+                result
             }
-
-            f(&*pool_ptr)
-        }
+            else {
+                f(&*pool_ptr)
+            }
+        })
     }
 
     /// The total number of worker threads in this pool.
     pub fn num_threads(&self) -> usize {
-        self.join_handles.len()
+        self.state.num_threads
     }
 
     /// Takes two closures and *potentially* runs them in parallel. It
@@ -283,11 +298,13 @@ impl ThreadPool {
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        self.state.should_stop.store(true, Ordering::Relaxed);
-        self.state.on_change.notify();
+        if let Some(join_handles) = &mut self.join_handles {
+            self.state.should_stop.store(true, Ordering::Relaxed);
+            self.state.on_change.notify();
 
-        for handle in self.join_handles.drain(..) {
-            let _ = handle.join();
+            for handle in join_handles.drain(..) {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -453,20 +470,21 @@ unsafe impl<'a, F: Fn(usize) -> (usize, usize)> GenericThreadPool for SplitPer<'
 pub(crate) struct ThreadPoolState {
     /// Threads waiting for work will spin for at least this many cycles before
     /// sleeping.
-    pub idle_spin_cycles: usize,
-    pub global_advertise_mask: AtomicBits,
+    idle_spin_cycles: usize,
+    global_advertise_mask: AtomicBits,
     /// Shared information about scheduled jobs. Threads reserve slots in this array
     /// using the [`Self::running_jobs`] member. Other threads can then search this
     /// array to look for work.
-    pub jobs: Vec<JobSlot>,
+    jobs: Vec<JobSlot>,
+    num_threads: usize,
     /// An event that is invoked whenever new work is available.
-    pub on_change: Event,
-    pub running_jobs: AtomicBits,
+    on_change: Event,
+    running_jobs: AtomicBits,
     /// Whether the parent [`ThreadPool`] is being dropped.
     /// This indicates that workers should exit.
-    pub should_stop: AtomicBool,
+    should_stop: AtomicBool,
     /// The tasks that are currently in progress.
-    pub tasks: spin::Mutex<VecDeque<Arc<dyn TaskInner>>>,
+    tasks: spin::Mutex<VecDeque<Arc<dyn TaskInner>>>,
 }
 
 impl ThreadPoolState {
@@ -479,6 +497,7 @@ impl ThreadPoolState {
             global_advertise_mask,
             idle_spin_cycles: builder.idle_spin_cycles,
             jobs: repeat_with(JobSlot::default).take(running_jobs.len()).collect(),
+            num_threads: builder.num_threads,
             on_change: Event::new(),
             running_jobs,
             should_stop: AtomicBool::new(false),
@@ -525,8 +544,26 @@ impl ThreadPoolState {
                 let slot = &self.jobs[index];
                 let times = times as i64;
 
-                let advertise_masks = [&self.global_advertise_mask];
-                let search_mask = &self.global_advertise_mask;
+                let previous_local_advertise_mask = LOCAL_ADVERTISE_MASK.get();
+                let search_mask = if previous_local_advertise_mask.is_null() {
+                    // Safety: todo
+                    unsafe {
+                        &*ADVERTISE_MASK_STORE.with(|x| {
+                            let array = unsafe { &mut *x.get() };
+                            if array.len() < self.global_advertise_mask.len() {
+                                *array = AtomicBits::new(self.global_advertise_mask.len());
+                            }
+
+                            x.get()
+                        })
+                    }
+                }
+                else {
+                    // Safety: todo
+                    unsafe { &*previous_local_advertise_mask }
+                };
+
+                let advertise_masks = [&self.global_advertise_mask, search_mask];
 
                 let descriptor = JobDescriptor {
                     clear_masks: &advertise_masks,
@@ -564,7 +601,7 @@ impl ThreadPoolState {
 
                     if 0 < remaining {
                         while 0 < descriptor.incomplete_units.load(Ordering::Relaxed) {
-                            if self.help_one_job(search_mask) {
+                            if self.help_one_job(search_mask, false) {
                                 spin_before_sleep = true;
                             }
                             else {
@@ -583,6 +620,7 @@ impl ThreadPoolState {
                     fence(Ordering::Acquire);
                 }
 
+                LOCAL_ADVERTISE_MASK.set(previous_local_advertise_mask);
                 self.release_job_slot(index);
             }
             else {
@@ -635,14 +673,14 @@ impl ThreadPoolState {
     fn help_global_jobs(&self) -> bool {
         let mut ran_item = false;
         
-        while self.help_one_job(&self.global_advertise_mask) {
+        while self.help_one_job(&self.global_advertise_mask, true) {
             ran_item = true;
         }
 
         ran_item
     }
 
-    fn help_one_job(&self, search_mask: &AtomicBits) -> bool {
+    fn help_one_job(&self, search_mask: &AtomicBits, overwrite_local_advertise_mask: bool) -> bool {
         for index in search_mask.iter_ones() {
             let slot = &self.jobs[index];
             let reserved_unit = slot.available_units.fetch_sub(1, Ordering::Relaxed) - 1;
@@ -656,13 +694,17 @@ impl ThreadPoolState {
                 let descriptor = unsafe { &*slot.descriptor.get().read().cast::<JobDescriptor>() };
 
                 if !std::ptr::eq(descriptor.search_mask, search_mask) {
-                    // The work unit corresponds to some other search set now. Cancel this task
-                    slot.available_units.fetch_add(1, Ordering::Relaxed);
+                    // The work unit corresponds to some other search set now. Cancel this task,
+                    // and make visible the memory reads from this thread
+                    slot.available_units.fetch_add(1, Ordering::Release);
                     self.on_change.notify();
                     continue;
                 }
-
-                // todo: set search mask (if worker)
+                
+                let previous_local_advertise_mask = LOCAL_ADVERTISE_MASK.get();
+                if overwrite_local_advertise_mask {
+                    LOCAL_ADVERTISE_MASK.set(descriptor.search_mask);
+                }
 
                 let locally_completed = (descriptor.func)(JobInvocation {
                     available_units: &slot.available_units,
@@ -671,7 +713,9 @@ impl ThreadPoolState {
                     slot: index
                 });
 
-                // todo: set search mask (if worker)
+                if overwrite_local_advertise_mask {
+                    LOCAL_ADVERTISE_MASK.set(previous_local_advertise_mask);
+                }
 
                 // The parallelized results must be made visible to the original thread
                 let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::Release) - locally_completed;
@@ -757,7 +801,7 @@ struct JobInvocation<'a> {
 }
 
 /// Holds a shared array of `bool`s. Each value is atomically modifiable.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct AtomicBits(Arc<[AtomicU64]>);
 
 impl AtomicBits {
