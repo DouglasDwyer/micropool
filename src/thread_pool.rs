@@ -516,6 +516,12 @@ impl ThreadPoolState {
         }
     }
 
+    /// Invokes `f` with the values `0..times`, potentially in parallel.
+    /// 
+    /// # Safety
+    /// 
+    /// The provided function should be [`Sync`] so that multiple threads can use it simultaneously.
+    /// The bound is elided here for convenience.
     pub unsafe fn invoke_sync_unchecked(&self, f: impl Fn(usize), times: usize) {
         /// Forces the compiler to accept that `f` is `Sync`.
         struct AssertSync<F>(F);
@@ -535,93 +541,78 @@ impl ThreadPoolState {
         self.invoke(move |i| unsafe { (f_sync.get())(i) }, times)
     }
 
+    /// Invokes `f` with values `0..times`, potentially in parallel.
     pub fn invoke(&self, f: impl Fn(usize) + Sync, times: usize) {
         match times {
             0 => {},
             1 => f(0),
             _ => if let Some(index) = self.reserve_job_slot() {
-                let func = Self::create_job_func(f);
-                let slot = &self.jobs[index];
-                let times = times as i64;
+                with_local_advertise_mask(self.global_advertise_mask.len(), |search_mask| {
+                    let func = Self::create_job_func(f);
+                    let slot = &self.jobs[index];
+                    let times = times as i64;
 
-                let previous_local_advertise_mask = LOCAL_ADVERTISE_MASK.get();
-                let search_mask = if previous_local_advertise_mask.is_null() {
-                    // Safety: todo
-                    unsafe {
-                        &*ADVERTISE_MASK_STORE.with(|x| {
-                            let array = unsafe { &mut *x.get() };
-                            if array.len() < self.global_advertise_mask.len() {
-                                *array = AtomicBits::new(self.global_advertise_mask.len());
-                            }
 
-                            x.get()
-                        })
+                    let advertise_masks = [&self.global_advertise_mask, search_mask];
+
+                    let descriptor = JobDescriptor {
+                        clear_masks: &advertise_masks,
+                        func: &func,
+                        incomplete_units: AtomicI64::new(times),
+                        search_mask
+                    };
+
+                    // Safety: the slot has been reserved but the job count is not yet published,
+                    // so no other threads will be reading the descriptor.
+                    unsafe { *slot.descriptor.get() = &descriptor as *const _ as *const _ };
+
+                    for mask in &advertise_masks {
+                        mask.set(index, true, Ordering::Relaxed);
                     }
-                }
-                else {
-                    // Safety: todo
-                    unsafe { &*previous_local_advertise_mask }
-                };
 
-                let advertise_masks = [&self.global_advertise_mask, search_mask];
+                    // The descriptor that was written must be made visible to other threads
+                    slot.available_units.store(times - 1, Ordering::Release);
 
-                let descriptor = JobDescriptor {
-                    clear_masks: &advertise_masks,
-                    func: &func,
-                    incomplete_units: AtomicI64::new(times),
-                    search_mask
-                };
+                    // Notify other threads of available work
+                    self.on_change.notify();
 
-                // Safety: the slot has been reserved but the job count is not yet published,
-                // so no other threads will be reading the descriptor.
-                unsafe { *slot.descriptor.get() = &descriptor as *const _ as *const _ };
+                    let locally_completed = func(JobInvocation {
+                        available_units: &slot.available_units,
+                        clear_masks: &advertise_masks,
+                        reserved_unit: times - 1,
+                        slot: index
+                    });
 
-                for mask in &advertise_masks {
-                    mask.set(index, true, Ordering::Relaxed);
-                }
+                    if locally_completed < times {
+                        let mut spin_before_sleep = true;
+                        let mut listener = self.on_change.listen();
 
-                // The descriptor that was written must be made visible to other threads
-                slot.available_units.store(times - 1, Ordering::Release);
+                        let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::Relaxed) - locally_completed;
 
-                // Notify other threads of available work
-                self.on_change.notify();
+                        if 0 < remaining {
+                            while 0 < descriptor.incomplete_units.load(Ordering::Relaxed) {
+                                if self.help_one_job(search_mask, false) {
+                                    spin_before_sleep = true;
+                                }
+                                else {
+                                    // Only spin if something was found to do since the last sleep
+                                    let spin_cycles = if spin_before_sleep {
+                                        self.idle_spin_cycles
+                                    } else {
+                                        0
+                                    };
 
-                let locally_completed = func(JobInvocation {
-                    available_units: &slot.available_units,
-                    clear_masks: &advertise_masks,
-                    reserved_unit: times - 1,
-                    slot: index
-                });
-
-                if locally_completed < times {
-                    let mut spin_before_sleep = true;
-                    let mut listener = self.on_change.listen();
-
-                    let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::Relaxed) - locally_completed;
-
-                    if 0 < remaining {
-                        while 0 < descriptor.incomplete_units.load(Ordering::Relaxed) {
-                            if self.help_one_job(search_mask, false) {
-                                spin_before_sleep = true;
-                            }
-                            else {
-                                // Only spin if something was found to do since the last sleep
-                                let spin_cycles = if spin_before_sleep {
-                                    self.idle_spin_cycles
-                                } else {
-                                    0
-                                };
-
-                                spin_before_sleep = !listener.spin_wait(spin_cycles);
+                                    spin_before_sleep = !listener.spin_wait(spin_cycles);
+                                }
                             }
                         }
+
+                        fence(Ordering::Acquire);
                     }
 
-                    fence(Ordering::Acquire);
-                }
-
-                LOCAL_ADVERTISE_MASK.set(previous_local_advertise_mask);
-                self.release_job_slot(index);
+                    // Safety: the job is no longer in use
+                    unsafe { self.release_job_slot(index); }
+                });
             }
             else {
                 // No job slot available - perform the work without parallelism
@@ -650,7 +641,7 @@ impl ThreadPoolState {
             } else if self.should_stop.load(Ordering::Relaxed) {
                 return;
             } else if let Some(task) = self.pop_task() {
-                //JoinPoint::join_task(&*task, true);
+                // todo: make better... publish advertising bits..?
                 task.run();
                 spin_before_sleep = true;
             } else {
@@ -694,31 +685,18 @@ impl ThreadPoolState {
                 let descriptor = unsafe { &*slot.descriptor.get().read().cast::<JobDescriptor>() };
 
                 if !change_advertise_mask && !std::ptr::eq(descriptor.search_mask, search_mask) {
-                    // The work unit corresponds to some other search set now. Cancel this task,
-                    // and make visible the memory reads from this thread to the owner
-                    slot.available_units.fetch_add(1, Ordering::Release);
-                    self.on_change.notify();
-                    // Note: there's a very small chance here that we took unit #0, leading to a premature
-                    // removal of this task from the advertising masks. That just means less parallelism, but
-                    // is not a correctness issue.
+                    todo!("spawn OwnedTask");
+                    // One option is to just ignore this case
                     continue;
                 }
-                
-                let previous_local_advertise_mask = LOCAL_ADVERTISE_MASK.get();
-                if change_advertise_mask {
-                    LOCAL_ADVERTISE_MASK.set(descriptor.search_mask);
-                }
 
-                let locally_completed = (descriptor.func)(JobInvocation {
+                let new_advertise_mask = if change_advertise_mask { descriptor.search_mask } else { search_mask };
+                let locally_completed = install_local_advertise_mask(new_advertise_mask, || (descriptor.func)(JobInvocation {
                     available_units: &slot.available_units,
                     clear_masks: descriptor.clear_masks,
                     reserved_unit,
                     slot: index
-                });
-
-                if change_advertise_mask {
-                    LOCAL_ADVERTISE_MASK.set(previous_local_advertise_mask);
-                }
+                }));
 
                 // The parallelized results must be made visible to the original thread
                 let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::Release) - locally_completed;
@@ -734,16 +712,26 @@ impl ThreadPoolState {
         false
     }
 
-    fn release_job_slot(&self, index: usize) {
-        // Release ordering: now that we are finished using the job slot,
+    /// Marks the given slot in [`Self::jobs`] as free. Other threads may reserve
+    /// the slot and write information there.
+    /// 
+    /// # Safety
+    /// 
+    /// This function must only be called with an index previously obtained from [`Self::reserve_job_slot`].
+    /// The slot should not be referenced again after this function is called.
+    unsafe fn release_job_slot(&self, index: usize) {
+        // Now that we are finished using the job slot,
         // we need to guarantee that any memory operations on it are visible.
         self.running_jobs.set(index, false, Ordering::Release);
     }
 
+    /// Reserves a slot in the [`Self::jobs`] array where a new descriptor can be written.
+    /// To do so, searches the [`Self::running_jobs`] bitset for a `false` entry
+    /// and replaces it with `true`. Returns [`None`] if all job slots were taken.
     fn reserve_job_slot(&self) -> Option<usize> {
         for index in self.running_jobs.iter_zeroes() {
             if !self.running_jobs.set(index, true, Ordering::Relaxed) {
-                // Acquire ordering: now that the job slot is reserved, we need to
+                // Now that the job slot is reserved, we need to
                 // guarantee that any previous operations using the same slot have finished.
                 fence(Ordering::Acquire);
                 return Some(index);
@@ -753,6 +741,7 @@ impl ThreadPoolState {
         None
     }
 
+    /// Wraps `f` in a callback that invokes it 
     fn create_job_func(f: impl Fn(usize) + Sync) -> impl Fn(JobInvocation) -> i64 {
         move |invocation| {
             let mut locally_completed = 0;
@@ -782,25 +771,92 @@ impl ThreadPoolState {
 unsafe impl Send for ThreadPoolState {}
 unsafe impl Sync for ThreadPoolState {}
 
+/// Stores shared information about a running job from [`ThreadPoolState::invoke`].
 #[derive(Debug, Default)]
 struct JobSlot {
-    available_units: AtomicI64,
-    descriptor: UnsafeCell<*const ()>
+    /// Tracks how many work units need to be **started** for this job.
+    /// Decrementing this counter corresponds to _reserving_ a job.
+    /// If the counter is negative, then no more jobs are available.
+    pub available_units: AtomicI64,
+    /// Points to the associated [`JobDescriptor`]. This is safe to access
+    /// after reserving a job.
+    pub descriptor: UnsafeCell<*const ()>
 }
 
+/// Holds metadata and state for a running job from [`ThreadPoolState::invoke`]
 struct JobDescriptor<'a> {
-    clear_masks: &'a [&'a AtomicBits],
-    func: &'a dyn Fn(JobInvocation) -> i64,
-    incomplete_units: AtomicI64,
-    search_mask: &'a AtomicBits,
+    /// Advertise masks to clear once all work units have been reserved.
+    pub clear_masks: &'a [&'a AtomicBits],
+    /// The function to invoke when running the job. This function will take
+    /// as many work units as possible until the [`JobSlot::available_units`]
+    /// counter goes negative. Returns the number of local units processed
+    /// without performing any other synchronization. It is the caller's responsibility
+    /// to update [`Self::incomplete_units`].
+    pub func: &'a dyn Fn(JobInvocation) -> i64,
+    /// The number of units that have not finished execution.
+    /// The descriptor is guaranteed to remain allocated until this reaches `0`.
+    pub incomplete_units: AtomicI64,
+    /// If a helping thread is blocked (waiting for a subjob to finish)
+    /// it should use this mask to find auxiliary work.
+    pub search_mask: &'a AtomicBits,
 }
 
+/// Passes information to a thread so it can run a parallel job in [`ThreadPoolState::create_job_func`].
+/// This includes the unit start counter and existing reserved unit.
 #[derive(Debug)]
 struct JobInvocation<'a> {
-    available_units: &'a AtomicI64,
-    clear_masks: &'a [&'a AtomicBits],
-    reserved_unit: i64,
-    slot: usize
+    /// Tracks how many more work units can be started for this job.
+    pub available_units: &'a AtomicI64,
+    /// Advertise masks to clear once all work units have been reserved.
+    pub clear_masks: &'a [&'a AtomicBits],
+    /// The first unit to run - this should have been previously reserveed
+    /// by decrementing [`Self::available_units`].
+    pub reserved_unit: i64,
+    /// The index of the associated [`JobSlot`].
+    pub slot: usize
+}
+
+/// Sets the thread-local mask used for tracking available jobs.
+/// The mask can then be accessed by calling [`with_local_advertise_mask`].
+fn install_local_advertise_mask<R>(mask: &AtomicBits, f: impl FnOnce() -> R) -> R {
+    abort_on_panic(|| {
+        let previous = LOCAL_ADVERTISE_MASK.get();
+        LOCAL_ADVERTISE_MASK.set(mask);
+        let result = f();
+        LOCAL_ADVERTISE_MASK.set(previous);
+        result
+    })
+}
+
+/// Gets the thread-local mask that should be used when searching for available jobs.
+/// If [`install_local_advertise_mask`] was called, then returns a reference to that mask.
+/// Otherwise, returns a mask specific to this thread with at least `capacity`.
+fn with_local_advertise_mask<R>(capacity: usize, f: impl FnOnce(&AtomicBits) -> R) -> R {
+    abort_on_panic(|| {
+        let previous_local_advertise_mask = LOCAL_ADVERTISE_MASK.get();
+        let mask = if previous_local_advertise_mask.is_null() {
+            // Safety: this block is non-reentrant (because it sets the mask pointer to a non-null value).
+            // Therefore, it is okay to modify the `UnsafeCell`
+            unsafe {
+                &*ADVERTISE_MASK_STORE.with(|x| {
+                    let array = unsafe { &mut *x.get() };
+                    if array.len() < capacity {
+                        *array = AtomicBits::new(capacity);
+                    }
+
+                    x.get()
+                })
+            }
+        }
+        else {
+            // Safety: the pointer was previously set with `install_local_advertise_mask` and should be valid
+            unsafe { &*previous_local_advertise_mask }
+        };
+
+        assert!(capacity <= mask.len(), "attempted to recursively access local advertise mask with different capacity");
+
+        install_local_advertise_mask(mask, || f(mask))
+    })
 }
 
 /// Holds a shared array of `bool`s. Each value is atomically modifiable.

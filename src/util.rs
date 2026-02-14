@@ -28,10 +28,8 @@ impl Event {
     }
 
     /// Notifies all listeners that this event has changed.
-    /// This operation guarantees a happens-before relationship between
-    /// all preceeding code and all subsequent calls to [`Self::listen`].
     pub fn notify(&self) {
-        let atomic = self.atomic.fetch_add(1, Ordering::SeqCst);
+        let atomic = self.atomic.fetch_add(1, Ordering::Release);
         if (atomic & Self::WAITER_FLAG) != 0 {
             self.atomic.fetch_and(!Event::WAITER_FLAG, Ordering::Relaxed);
             self.atomic.notify_all();
@@ -40,12 +38,10 @@ impl Event {
 
     /// Begins listening for changes to `self`. The event listener
     /// will block until [`Self::notify`] is called by another thread.
-    /// This operation guarantees a happens-before relationship between
-    /// the last call to [`Self::listen`] and all subsequent code.
     pub fn listen(&self) -> EventListener<'_> {
         EventListener {
             event: self,
-            version: self.atomic.load(Ordering::SeqCst) & !Self::WAITER_FLAG,
+            version: self.atomic.load(Ordering::Acquire) & !Self::WAITER_FLAG,
         }
     }
 }
@@ -107,9 +103,8 @@ impl<'a> EventListener<'a> {
         
         if self.version != new_version {
             // Since the version incremented, memory writes from signaling threads
-            // must be made visible to this thread. Additionally, we must guarantee
-            // a happens-before relationship between this call and all subsequent code.
-            fence(Ordering::SeqCst);
+            // must be made visible to this thread.
+            fence(Ordering::Acquire);
 
             self.version = new_version;            
             true
