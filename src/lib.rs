@@ -285,14 +285,14 @@ mod tests {
         let mut result = [0; 5];
         (result.par_iter_mut(), (1..=5).into_par_iter())
             .zip_eq()
-            .with_thread_pool(crate::split_by_threads())
+            .with_thread_pool(crate::split_per_item())
             .for_each(|(out, x)| *out = x * x - 1);
         assert_eq!([0, 3, 8, 15, 24], result);
     }
 
     /// Spawns and joins many tasks.
     #[test]
-    fn execute_many() {
+    fn test_execute_many() {
         let first_task = crate::spawn_owned(|| 2);
         let second_task = crate::spawn_owned(|| 2);
         assert_eq!(first_task.join(), second_task.join());
@@ -304,5 +304,23 @@ mod tests {
                 crate::spawn_owned(|| std::thread::sleep(std::time::Duration::new(0, 200)));
             assert_eq!(third_task.join(), fourth_task.join());
         }
+    }
+
+    /// Tests that executing parallel tasks from two external threads works correctly.
+    #[test]
+    fn test_two_roots() {
+        let for_each = || for _ in 0..100 {
+            let mut result = [0; 500];
+            result.par_iter_mut()
+                .enumerate()
+                .with_thread_pool(crate::split_per_item())
+                .for_each(|(x, out)| *out = x * x + 1);
+        };
+
+        let a = std::thread::spawn(for_each);
+        let b = std::thread::spawn(for_each);
+
+        let _ = a.join();
+        let _ = b.join();
     }
 }
