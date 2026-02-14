@@ -290,7 +290,6 @@ mod tests {
         assert_eq!([0, 3, 8, 15, 24], result);
     }
 
-    /*
     /// Spawns and joins many tasks.
     #[test]
     fn execute_many() {
@@ -305,5 +304,5 @@ mod tests {
                 crate::spawn_owned(|| std::thread::sleep(std::time::Duration::new(0, 200)));
             assert_eq!(third_task.join(), fourth_task.join());
         }
-    } */
+    }
 }

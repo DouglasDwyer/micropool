@@ -576,12 +576,12 @@ impl ThreadPoolState {
                 // so no other threads will be reading the descriptor.
                 unsafe { *slot.descriptor.get() = &descriptor as *const _ as *const _ };
 
-                // The descriptor that was written must be made visible to other threads
-                slot.available_units.store(times - 1, Ordering::Release);
-
                 for mask in &advertise_masks {
                     mask.set(index, true, Ordering::Relaxed);
                 }
+
+                // The descriptor that was written must be made visible to other threads
+                slot.available_units.store(times - 1, Ordering::Release);
 
                 // Notify other threads of available work
                 self.on_change.notify();
@@ -680,7 +680,7 @@ impl ThreadPoolState {
         ran_item
     }
 
-    fn help_one_job(&self, search_mask: &AtomicBits, overwrite_local_advertise_mask: bool) -> bool {
+    fn help_one_job(&self, search_mask: &AtomicBits, change_advertise_mask: bool) -> bool {
         for index in search_mask.iter_ones() {
             let slot = &self.jobs[index];
             let reserved_unit = slot.available_units.fetch_sub(1, Ordering::Relaxed) - 1;
@@ -693,16 +693,19 @@ impl ThreadPoolState {
                 // and will remain so until the unit is processed.
                 let descriptor = unsafe { &*slot.descriptor.get().read().cast::<JobDescriptor>() };
 
-                if !std::ptr::eq(descriptor.search_mask, search_mask) {
+                if !change_advertise_mask && !std::ptr::eq(descriptor.search_mask, search_mask) {
                     // The work unit corresponds to some other search set now. Cancel this task,
-                    // and make visible the memory reads from this thread
+                    // and make visible the memory reads from this thread to the owner
                     slot.available_units.fetch_add(1, Ordering::Release);
                     self.on_change.notify();
+                    // Note: there's a very small chance here that we took unit #0, leading to a premature
+                    // removal of this task from the advertising masks. That just means less parallelism, but
+                    // is not a correctness issue.
                     continue;
                 }
                 
                 let previous_local_advertise_mask = LOCAL_ADVERTISE_MASK.get();
-                if overwrite_local_advertise_mask {
+                if change_advertise_mask {
                     LOCAL_ADVERTISE_MASK.set(descriptor.search_mask);
                 }
 
@@ -713,7 +716,7 @@ impl ThreadPoolState {
                     slot: index
                 });
 
-                if overwrite_local_advertise_mask {
+                if change_advertise_mask {
                     LOCAL_ADVERTISE_MASK.set(previous_local_advertise_mask);
                 }
 
