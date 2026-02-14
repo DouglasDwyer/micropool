@@ -308,15 +308,19 @@ mod tests {
         }
     }
 
-    /// Tests that executing parallel tasks from two external threads works correctly.
+    /// Tests that executing parallel tasks from two external threads works
+    /// correctly.
     #[test]
     fn test_two_roots() {
-        let for_each = || for _ in 0..10 {
-            let mut result = [0; 500];
-            result.par_iter_mut()
-                .enumerate()
-                .with_thread_pool(crate::split_per_item())
-                .for_each(|(x, out)| *out = x * x + 1);
+        let for_each = || {
+            for _ in 0..10 {
+                let mut result = [0; 500];
+                result
+                    .par_iter_mut()
+                    .enumerate()
+                    .with_thread_pool(crate::split_per_item())
+                    .for_each(|(x, out)| *out = x * x + 1);
+            }
         };
 
         let a = std::thread::spawn(for_each);
@@ -325,30 +329,33 @@ mod tests {
         let _ = a.join();
         let _ = b.join();
     }
-    
 
-    /// Tests that executing parallel tasks from two external threads works correctly.
+    /// Tests that executing parallel tasks from two external threads works
+    /// correctly.
     #[test]
     fn test_many_roots() {
-        let for_each = || for _ in 0..10 {
-            let mut result = [0; 5];
-            result.par_iter_mut()
-                .enumerate()
-                .with_thread_pool(crate::split_per_item())
-                .for_each(|(x, out)| {
-                    if x == 0 {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    
-                    *out = x * x + 1;
-                });
+        let for_each = || {
+            for _ in 0..10 {
+                let mut result = [0; 5];
+                result
+                    .par_iter_mut()
+                    .enumerate()
+                    .with_thread_pool(crate::split_per_item())
+                    .for_each(|(x, out)| {
+                        if x == 0 {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+
+                        *out = x * x + 1;
+                    });
+            }
         };
 
         let mut handles = Vec::new();
         for _ in 0..16 {
             handles.push(std::thread::spawn(for_each));
         }
-        
+
         for handle in handles {
             let _ = handle.join();
         }

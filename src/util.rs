@@ -1,4 +1,4 @@
-use std::hint::{spin_loop};
+use std::hint::spin_loop;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::thread::{self};
 use wait_on_address::AtomicWait;
@@ -31,7 +31,8 @@ impl Event {
     pub fn notify(&self) {
         let atomic = self.atomic.fetch_add(1, Ordering::Release);
         if (atomic & Self::WAITER_FLAG) != 0 {
-            self.atomic.fetch_and(!Event::WAITER_FLAG, Ordering::Relaxed);
+            self.atomic
+                .fetch_and(!Event::WAITER_FLAG, Ordering::Relaxed);
             self.atomic.notify_all();
         }
     }
@@ -76,7 +77,8 @@ impl<'a> EventListener<'a> {
     }
 
     /// Blocks the current thread. Returns when [`Event::notify`] has been
-    /// called at least once since the previous call to [`Self::wait`] (or this listener's creation).
+    /// called at least once since the previous call to [`Self::wait`] (or this
+    /// listener's creation).
     pub fn wait(&mut self) {
         let (Ok(atomic) | Err(atomic)) = self.event.atomic.compare_exchange(
             self.version,
@@ -96,20 +98,20 @@ impl<'a> EventListener<'a> {
         }
     }
 
-    /// Checks to see whether the listener was signaled based upon the value of `atomic`.
-    /// If so, updates the internal version counter (so that [`Self::wait`] can be called again).
+    /// Checks to see whether the listener was signaled based upon the value of
+    /// `atomic`. If so, updates the internal version counter (so that
+    /// [`Self::wait`] can be called again).
     fn read_new_version(&mut self, atomic: u64) -> bool {
         let new_version = atomic & !Event::WAITER_FLAG;
-        
+
         if self.version != new_version {
             // Since the version incremented, memory writes from signaling threads
             // must be made visible to this thread.
             fence(Ordering::Acquire);
 
-            self.version = new_version;            
+            self.version = new_version;
             true
-        }
-        else {
+        } else {
             false
         }
     }

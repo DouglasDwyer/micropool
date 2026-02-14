@@ -114,7 +114,8 @@ impl<T: 'static + Send + Sync> SharedTask<T> {
         // less than three, but in that case `cancel_task` is a no-op. So, this
         // is correct.
         if Arc::strong_count(&self.0) < 3
-            && let Some(pool) = self.0.pool.upgrade() {
+            && let Some(pool) = self.0.pool.upgrade()
+        {
             pool.cancel_task(&self.0);
         }
     }
@@ -169,8 +170,10 @@ impl<T: 'static + Send + Sync> std::fmt::Debug for SharedTask<T> {
 
 /// Allows for thread pools to manipulate the inner task state.
 pub(crate) trait TaskInner: Send {
-    /// Executes the inner task. If the task was already running, then returns immediately.
-    fn run(&self);
+    /// Executes the inner task.
+    /// Returns `true` if the task executed, or `false`
+    /// if it was already taken by a different thread.
+    fn run(&self) -> bool;
 }
 
 /// Manages the state of a task.
@@ -185,9 +188,12 @@ struct TypedTaskInner<T: Send + Sync> {
 
 impl<T: Send + Sync> TaskInner for TypedTaskInner<T> {
     #[inline(always)]
-    fn run(&self) {
+    fn run(&self) -> bool {
         if let Some(f) = self.func.take() {
             self.result.call_once(|| f());
+            true
+        } else {
+            false
         }
     }
 }

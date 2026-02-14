@@ -1,12 +1,9 @@
-#![allow(unused)]
-
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::hint::unreachable_unchecked;
 use std::iter::repeat_with;
-use std::mem::{MaybeUninit, transmute};
+use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
-use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering, fence};
 use std::thread::{self, JoinHandle, available_parallelism};
@@ -43,11 +40,13 @@ pub struct ThreadPoolBuilder {
     /// Threads waiting for work will spin at least this many cycles before
     /// sleeping.
     idle_spin_cycles: usize,
-    /// The maximum supported number of concurrent jobs (created through parallel iterators or calls to [`ThreadPool::join`]).
-    /// By default, this is set to `8 * std::thread::available_parallelism()`.
+    /// The maximum supported number of concurrent jobs (created through
+    /// parallel iterators or calls to [`ThreadPool::join`]). By default,
+    /// this is set to `8 * std::thread::available_parallelism()`.
     max_jobs: usize,
     /// The number of threads to spawn.
-    /// By default, this is set to `std::thread::available_parallelism().saturating_sub(1).max(1)`.
+    /// By default, this is set to
+    /// `std::thread::available_parallelism().saturating_sub(1).max(1)`.
     num_threads: usize,
     /// The function to use when spawning new threads.
     spawn_handler: Box<ThreadSpawnerFn>,
@@ -148,11 +147,17 @@ impl ThreadPool {
         let mut join_handles = Vec::with_capacity(builder.num_threads);
         for i in 0..builder.num_threads {
             let state_cloned = state.clone();
-            join_handles.push((builder.spawn_handler)(i, Box::new(move || {
-                let thread_pool = Self { join_handles: None, state: state_cloned };
-                LOCAL_POOL.set(&thread_pool);
-                thread_pool.state.join()
-            })));
+            join_handles.push((builder.spawn_handler)(
+                i,
+                Box::new(move || {
+                    let thread_pool = Self {
+                        join_handles: None,
+                        state: state_cloned,
+                    };
+                    LOCAL_POOL.set(&thread_pool);
+                    thread_pool.state.join()
+                }),
+            ));
         }
 
         Self {
@@ -170,7 +175,7 @@ impl ThreadPool {
                 LOCAL_POOL.get().is_null(),
                 "cannot call install recursively"
             );
-            
+
             LOCAL_POOL.set(self);
             let result = f();
             LOCAL_POOL.set(std::ptr::null());
@@ -208,8 +213,7 @@ impl ThreadPool {
                 let result = f(&*pool_ptr);
                 LOCAL_POOL.set(std::ptr::null());
                 result
-            }
-            else {
+            } else {
                 f(&*pool_ptr)
             }
         })
@@ -472,9 +476,9 @@ pub(crate) struct ThreadPoolState {
     /// sleeping.
     idle_spin_cycles: usize,
     global_advertise_mask: AtomicBits,
-    /// Shared information about scheduled jobs. Threads reserve slots in this array
-    /// using the [`Self::running_jobs`] member. Other threads can then search this
-    /// array to look for work.
+    /// Shared information about scheduled jobs. Threads reserve slots in this
+    /// array using the [`Self::running_jobs`] member. Other threads can
+    /// then search this array to look for work.
     jobs: Vec<JobSlot>,
     num_threads: usize,
     /// An event that is invoked whenever new work is available.
@@ -496,7 +500,9 @@ impl ThreadPoolState {
         Self {
             global_advertise_mask,
             idle_spin_cycles: builder.idle_spin_cycles,
-            jobs: repeat_with(JobSlot::default).take(running_jobs.len()).collect(),
+            jobs: repeat_with(JobSlot::default)
+                .take(running_jobs.len())
+                .collect(),
             num_threads: builder.num_threads,
             on_change: Event::new(),
             running_jobs,
@@ -517,109 +523,36 @@ impl ThreadPoolState {
     }
 
     /// Invokes `f` with the values `0..times`, potentially in parallel.
-    /// 
+    ///
     /// # Safety
-    /// 
-    /// The provided function should be [`Sync`] so that multiple threads can use it simultaneously.
-    /// The bound is elided here for convenience.
+    ///
+    /// The provided function should be [`Sync`] so that multiple threads can
+    /// use it simultaneously. The bound is elided here for convenience.
     pub unsafe fn invoke_sync_unchecked(&self, f: impl Fn(usize), times: usize) {
         /// Forces the compiler to accept that `f` is `Sync`.
         struct AssertSync<F>(F);
-        
+
         impl<F> AssertSync<F> {
             /// Gets the inner value.
             pub unsafe fn get(&self) -> &F {
                 &self.0
             }
         }
-        
+
         // Safety: guaranteed by the outer function invariant
         unsafe impl<F> Sync for AssertSync<F> {}
 
         let f_sync = AssertSync(f);
-        
+
         self.invoke(move |i| unsafe { (f_sync.get())(i) }, times)
     }
 
     /// Invokes `f` with values `0..times`, potentially in parallel.
     pub fn invoke(&self, f: impl Fn(usize) + Sync, times: usize) {
         match times {
-            0 => {},
+            0 => {}
             1 => f(0),
-            _ => if let Some(index) = self.reserve_job_slot() {
-                with_local_advertise_mask(self.global_advertise_mask.len(), |search_mask| {
-                    let func = Self::create_job_func(f);
-                    let slot = &self.jobs[index];
-                    let times = times as i64;
-
-
-                    let advertise_masks = [&self.global_advertise_mask, search_mask];
-
-                    let descriptor = JobDescriptor {
-                        clear_masks: &advertise_masks,
-                        func: &func,
-                        incomplete_units: AtomicI64::new(times),
-                        search_mask
-                    };
-
-                    // Safety: the slot has been reserved but the job count is not yet published,
-                    // so no other threads will be reading the descriptor.
-                    unsafe { *slot.descriptor.get() = &descriptor as *const _ as *const _ };
-
-                    for mask in &advertise_masks {
-                        mask.set(index, true, Ordering::Relaxed);
-                    }
-
-                    // The descriptor that was written must be made visible to other threads
-                    slot.available_units.store(times - 1, Ordering::Release);
-
-                    // Notify other threads of available work
-                    self.on_change.notify();
-
-                    let locally_completed = func(JobInvocation {
-                        available_units: &slot.available_units,
-                        clear_masks: &advertise_masks,
-                        reserved_unit: times - 1,
-                        slot: index
-                    });
-
-                    if locally_completed < times {
-                        let mut spin_before_sleep = true;
-                        let mut listener = self.on_change.listen();
-
-                        let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::Relaxed) - locally_completed;
-
-                        if 0 < remaining {
-                            while 0 < descriptor.incomplete_units.load(Ordering::Relaxed) {
-                                if self.help_one_job(search_mask, false) {
-                                    spin_before_sleep = true;
-                                }
-                                else {
-                                    // Only spin if something was found to do since the last sleep
-                                    let spin_cycles = if spin_before_sleep {
-                                        self.idle_spin_cycles
-                                    } else {
-                                        0
-                                    };
-
-                                    spin_before_sleep = !listener.spin_wait(spin_cycles);
-                                }
-                            }
-                        }
-
-                        fence(Ordering::Acquire);
-                    }
-
-                    // Safety: the job is no longer in use
-                    unsafe { self.release_job_slot(index); }
-                });
-            }
-            else {
-                // No job slot available - perform the work without parallelism
-                for i in 0..times {
-                    f(i);
-                }
-            }
+            _ => self.invoke_parallel_job(f, times),
         }
     }
 
@@ -641,9 +574,7 @@ impl ThreadPoolState {
             } else if self.should_stop.load(Ordering::Relaxed) {
                 return;
             } else if let Some(task) = self.pop_task() {
-                // todo: make better... publish advertising bits..?
-                task.run();
-                spin_before_sleep = true;
+                spin_before_sleep |= task.run();
             } else {
                 // Only spin if something was found to do since the last sleep
                 let spin_cycles = if spin_before_sleep {
@@ -661,9 +592,12 @@ impl ThreadPoolState {
         self.tasks.lock().pop_front()
     }
 
+    /// Executes as many queued jobs as possible. Searches within the
+    /// [`Self::global_advertise_mask`]. Returns `true` if at least one job
+    /// ran.
     fn help_global_jobs(&self) -> bool {
         let mut ran_item = false;
-        
+
         while self.help_one_job(&self.global_advertise_mask, true) {
             ran_item = true;
         }
@@ -671,6 +605,8 @@ impl ThreadPoolState {
         ran_item
     }
 
+    /// Attempts to find a job in `search_mask` and run it.
+    /// Returns whether a job was found.
     fn help_one_job(&self, search_mask: &AtomicBits, change_advertise_mask: bool) -> bool {
         for index in search_mask.iter_ones() {
             let slot = &self.jobs[index];
@@ -678,8 +614,7 @@ impl ThreadPoolState {
 
             if reserved_unit < 0 {
                 continue;
-            }
-            else {
+            } else {
                 // The job descriptor must be made visible to this thread
                 fence(Ordering::Acquire);
 
@@ -687,23 +622,26 @@ impl ThreadPoolState {
                 // and will remain so until the unit is processed.
                 let descriptor = unsafe { &*slot.descriptor.get().read().cast::<JobDescriptor>() };
 
-                if !change_advertise_mask && !std::ptr::eq(descriptor.search_mask, search_mask) {
-                    todo!("spawn OwnedTask");
-                    // One option is to just ignore this case
-                    continue;
-                }
-
-                let new_advertise_mask = if change_advertise_mask { descriptor.search_mask } else { search_mask };
-                let locally_completed = install_local_advertise_mask(new_advertise_mask, || (descriptor.func)(JobInvocation {
-                    available_units: &slot.available_units,
-                    clear_masks: descriptor.clear_masks,
-                    reserved_unit,
-                    slot: index
-                }));
+                let new_advertise_mask = if change_advertise_mask {
+                    descriptor.search_mask
+                } else {
+                    search_mask
+                };
+                let locally_completed = install_local_advertise_mask(new_advertise_mask, || {
+                    (descriptor.func)(JobInvocation {
+                        available_units: &slot.available_units,
+                        clear_masks: descriptor.clear_masks,
+                        reserved_unit,
+                        slot: index,
+                    })
+                });
 
                 // The parallelized results must be made visible to the original thread
-                let remaining = descriptor.incomplete_units.fetch_sub(locally_completed, Ordering::Release) - locally_completed;
-                
+                let remaining = descriptor
+                    .incomplete_units
+                    .fetch_sub(locally_completed, Ordering::Release)
+                    - locally_completed;
+
                 if remaining == 0 {
                     self.on_change.notify();
                 }
@@ -715,22 +653,124 @@ impl ThreadPoolState {
         false
     }
 
-    /// Marks the given slot in [`Self::jobs`] as free. Other threads may reserve
-    /// the slot and write information there.
-    /// 
+    /// Registers a job for `f` in the jobs list (if possible).
+    /// Runs `f` with values `0..times` in parallel.
+    fn invoke_parallel_job(&self, f: impl Fn(usize) + Sync, times: usize) {
+        if let Some(index) = self.reserve_job_slot() {
+            // Safety: the job was properly reserved
+            unsafe {
+                self.invoke_parallel_job_at_slot(f, times, index);
+            }
+            // Safety: the job is no longer in use
+            unsafe {
+                self.release_job_slot(index);
+            }
+        } else {
+            // No job slot available - perform the work without parallelism
+            for i in 0..times {
+                f(i);
+            }
+        }
+    }
+
+    /// Writes the job for `f` into the slot at `index`.
+    /// Then, executes the job and polls for other work until it finishes.
+    ///
     /// # Safety
-    /// 
-    /// This function must only be called with an index previously obtained from [`Self::reserve_job_slot`].
-    /// The slot should not be referenced again after this function is called.
+    ///
+    /// The job slot `index` should have been reserved specifically for this.
+    /// It should not be in use by other threads.
+    unsafe fn invoke_parallel_job_at_slot(
+        &self,
+        f: impl Fn(usize) + Sync,
+        times: usize,
+        index: usize,
+    ) {
+        with_local_advertise_mask(self.global_advertise_mask.len(), |search_mask| {
+            let func = Self::create_job_func(f);
+            let slot = &self.jobs[index];
+            let times = times as i64;
+
+            let advertise_masks = [&self.global_advertise_mask, search_mask];
+
+            let descriptor = JobDescriptor {
+                clear_masks: &advertise_masks,
+                func: &func,
+                incomplete_units: AtomicI64::new(times),
+                search_mask,
+            };
+
+            // Safety: the slot has been reserved but the job count is not yet published,
+            // so no other threads will be reading the descriptor.
+            unsafe { *slot.descriptor.get() = &descriptor as *const _ as *const _ };
+
+            for mask in &advertise_masks {
+                mask.set(index, true, Ordering::Relaxed);
+            }
+
+            // The descriptor that was written must be made visible to other threads
+            slot.available_units.store(times - 1, Ordering::Release);
+
+            // Notify other threads of available work
+            self.on_change.notify();
+
+            let locally_completed = func(JobInvocation {
+                available_units: &slot.available_units,
+                clear_masks: &advertise_masks,
+                reserved_unit: times - 1,
+                slot: index,
+            });
+
+            if locally_completed < times {
+                let mut listener = self.on_change.listen();
+                let mut spin_before_sleep = true;
+
+                let remaining = descriptor
+                    .incomplete_units
+                    .fetch_sub(locally_completed, Ordering::Relaxed)
+                    - locally_completed;
+
+                if 0 < remaining {
+                    while 0 < descriptor.incomplete_units.load(Ordering::Relaxed) {
+                        if self.help_one_job(search_mask, false) {
+                            spin_before_sleep = true;
+                        } else {
+                            // Only spin if something was found to do since the last sleep
+                            let spin_cycles = if spin_before_sleep {
+                                self.idle_spin_cycles
+                            } else {
+                                0
+                            };
+
+                            spin_before_sleep = !listener.spin_wait(spin_cycles);
+                        }
+                    }
+                }
+
+                // Make the parallel results from other threads visible to the original thread
+                fence(Ordering::Acquire);
+            }
+        });
+    }
+
+    /// Marks the given slot in [`Self::jobs`] as free. Other threads may
+    /// reserve the slot and write information there.
+    ///
+    /// # Safety
+    ///
+    /// This function must only be called with an index previously obtained from
+    /// [`Self::reserve_job_slot`]. The slot should not be referenced again
+    /// after this function is called.
     unsafe fn release_job_slot(&self, index: usize) {
         // Now that we are finished using the job slot,
         // we need to guarantee that any memory operations on it are visible.
         self.running_jobs.set(index, false, Ordering::Release);
     }
 
-    /// Reserves a slot in the [`Self::jobs`] array where a new descriptor can be written.
-    /// To do so, searches the [`Self::running_jobs`] bitset for a `false` entry
-    /// and replaces it with `true`. Returns [`None`] if all job slots were taken.
+    /// Reserves a slot in the [`Self::jobs`] array where a new descriptor can
+    /// be written. To do so, searches the [`Self::running_jobs`] bitset for
+    /// a `false` entry and replaces it with `true`. Returns [`None`] if all
+    /// job slots were taken.
     fn reserve_job_slot(&self) -> Option<usize> {
         for index in self.running_jobs.iter_zeroes() {
             if !self.running_jobs.set(index, true, Ordering::Relaxed) {
@@ -744,7 +784,7 @@ impl ThreadPoolState {
         None
     }
 
-    /// Wraps `f` in a callback that invokes it 
+    /// Wraps `f` in a callback that invokes it
     fn create_job_func(f: impl Fn(usize) + Sync) -> impl Fn(JobInvocation) -> i64 {
         move |invocation| {
             let mut locally_completed = 0;
@@ -753,13 +793,12 @@ impl ThreadPoolState {
             loop {
                 if next_unit < 0 {
                     break;
-                }
-                else if next_unit == 0 {
+                } else if next_unit == 0 {
                     for mask in invocation.clear_masks {
                         mask.set(invocation.slot, false, Ordering::Relaxed);
                     }
                 }
-                
+
                 f(next_unit as usize);
                 locally_completed += 1;
 
@@ -774,7 +813,8 @@ impl ThreadPoolState {
 unsafe impl Send for ThreadPoolState {}
 unsafe impl Sync for ThreadPoolState {}
 
-/// Stores shared information about a running job from [`ThreadPoolState::invoke`].
+/// Stores shared information about a running job from
+/// [`ThreadPoolState::invoke`].
 #[derive(Debug, Default)]
 struct JobSlot {
     /// Tracks how many work units need to be **started** for this job.
@@ -783,7 +823,7 @@ struct JobSlot {
     pub available_units: AtomicI64,
     /// Points to the associated [`JobDescriptor`]. This is safe to access
     /// after reserving a job.
-    pub descriptor: UnsafeCell<*const ()>
+    pub descriptor: UnsafeCell<*const ()>,
 }
 
 /// Holds metadata and state for a running job from [`ThreadPoolState::invoke`]
@@ -793,8 +833,8 @@ struct JobDescriptor<'a> {
     /// The function to invoke when running the job. This function will take
     /// as many work units as possible until the [`JobSlot::available_units`]
     /// counter goes negative. Returns the number of local units processed
-    /// without performing any other synchronization. It is the caller's responsibility
-    /// to update [`Self::incomplete_units`].
+    /// without performing any other synchronization. It is the caller's
+    /// responsibility to update [`Self::incomplete_units`].
     pub func: &'a dyn Fn(JobInvocation) -> i64,
     /// The number of units that have not finished execution.
     /// The descriptor is guaranteed to remain allocated until this reaches `0`.
@@ -804,8 +844,9 @@ struct JobDescriptor<'a> {
     pub search_mask: &'a AtomicBits,
 }
 
-/// Passes information to a thread so it can run a parallel job in [`ThreadPoolState::create_job_func`].
-/// This includes the unit start counter and existing reserved unit.
+/// Passes information to a thread so it can run a parallel job in
+/// [`ThreadPoolState::create_job_func`]. This includes the unit start counter
+/// and existing reserved unit.
 #[derive(Debug)]
 struct JobInvocation<'a> {
     /// Tracks how many more work units can be started for this job.
@@ -816,7 +857,7 @@ struct JobInvocation<'a> {
     /// by decrementing [`Self::available_units`].
     pub reserved_unit: i64,
     /// The index of the associated [`JobSlot`].
-    pub slot: usize
+    pub slot: usize,
 }
 
 /// Sets the thread-local mask used for tracking available jobs.
@@ -831,18 +872,19 @@ fn install_local_advertise_mask<R>(mask: &AtomicBits, f: impl FnOnce() -> R) -> 
     })
 }
 
-/// Gets the thread-local mask that should be used when searching for available jobs.
-/// If [`install_local_advertise_mask`] was called, then returns a reference to that mask.
-/// Otherwise, returns a mask specific to this thread with at least `capacity`.
+/// Gets the thread-local mask that should be used when searching for available
+/// jobs. If [`install_local_advertise_mask`] was called, then returns a
+/// reference to that mask. Otherwise, returns a mask specific to this thread
+/// with at least `capacity`.
 fn with_local_advertise_mask<R>(capacity: usize, f: impl FnOnce(&AtomicBits) -> R) -> R {
     abort_on_panic(|| {
         let previous_local_advertise_mask = LOCAL_ADVERTISE_MASK.get();
         let mask = if previous_local_advertise_mask.is_null() {
-            // Safety: this block is non-reentrant (because it sets the mask pointer to a non-null value).
-            // Therefore, it is okay to modify the `UnsafeCell`
+            // Safety: this block is non-reentrant (because it sets the mask pointer to a
+            // non-null value). Therefore, it is okay to modify the `UnsafeCell`
             unsafe {
                 &*ADVERTISE_MASK_STORE.with(|x| {
-                    let array = unsafe { &mut *x.get() };
+                    let array = &mut *x.get();
                     if array.len() < capacity {
                         *array = AtomicBits::new(capacity);
                     }
@@ -850,13 +892,16 @@ fn with_local_advertise_mask<R>(capacity: usize, f: impl FnOnce(&AtomicBits) -> 
                     x.get()
                 })
             }
-        }
-        else {
-            // Safety: the pointer was previously set with `install_local_advertise_mask` and should be valid
+        } else {
+            // Safety: the pointer was previously set with `install_local_advertise_mask`
+            // and should be valid
             unsafe { &*previous_local_advertise_mask }
         };
 
-        assert!(capacity <= mask.len(), "attempted to recursively access local advertise mask with different capacity");
+        assert!(
+            capacity <= mask.len(),
+            "attempted to recursively access local advertise mask with different capacity"
+        );
 
         install_local_advertise_mask(mask, || f(mask))
     })
@@ -877,21 +922,6 @@ impl AtomicBits {
         Self(repeat_with(AtomicU64::default).take(elements).collect())
     }
 
-    /// Loads the value of the bit at `index`.
-    /// Valid atomic orderings are [`Ordering::SeqCst`],
-    /// [`Ordering::Acquire`], and [`Ordering::Relaxed`].
-    pub fn get(&self, index: usize, order: Ordering) -> bool {
-        let (element, bit) = Self::element_bit(index);
-        let mask = 1 << bit;
-
-        (self.0[element].load(order) & mask) != 0
-    }
-
-    /// Returns `true` if there are no values in this array.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     /// Returns an iterator over all `true` values in the array.
     /// This is always an [`Ordering::Relaxed`] operation, since
     /// different parts of the array may be loaded at different times.
@@ -901,7 +931,7 @@ impl AtomicBits {
             bits: self,
             current_value: 0,
             invert_mask: 0,
-            next_element: 0
+            next_element: 0,
         }
     }
 
@@ -919,7 +949,7 @@ impl AtomicBits {
             bits: self,
             current_value: 0,
             invert_mask: u64::MAX,
-            next_element: 0
+            next_element: 0,
         }
     }
 
@@ -932,8 +962,7 @@ impl AtomicBits {
 
         let previous = if value {
             element.fetch_or(mask, order)
-        }
-        else {
+        } else {
             element.fetch_and(!mask, order)
         };
 
@@ -941,7 +970,7 @@ impl AtomicBits {
     }
 
     /// Decomposes `index` into two parts:
-    /// 
+    ///
     /// - The location of the [`AtomicU64`] within the backing array
     /// - The location of the bit within that number
     fn element_bit(index: usize) -> (usize, usize) {
@@ -949,7 +978,8 @@ impl AtomicBits {
     }
 }
 
-/// Enumerates the indices of `true` values or `false` values in an [`AtomicBits`] array.
+/// Enumerates the indices of `true` values or `false` values in an
+/// [`AtomicBits`] array.
 struct AtomicBitsIter<'a> {
     /// The overall index of the starting bit in [`Self::current_value`].
     base_index: usize,
@@ -975,12 +1005,11 @@ impl Iterator for AtomicBitsIter<'_> {
 
                 self.base_index = AtomicBits::ELEMENT_BITS * self.next_element;
                 self.next_element += 1;
-            }
-            else {
+            } else {
                 return None;
             }
         }
-        
+
         let bit = self.current_value.trailing_zeros();
         self.current_value &= (u64::MAX << 1) << bit;
         Some(self.base_index + bit as usize)
