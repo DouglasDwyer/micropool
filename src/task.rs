@@ -190,7 +190,7 @@ impl<T: Send + Sync> TaskInner for TypedTaskInner<T> {
     #[inline(always)]
     fn run(&self) -> bool {
         if let Some(f) = self.func.take() {
-            self.result.call_once(|| f());
+            self.result.call_once(f);
             true
         } else {
             false

@@ -475,14 +475,17 @@ pub(crate) struct ThreadPoolState {
     /// Threads waiting for work will spin for at least this many cycles before
     /// sleeping.
     idle_spin_cycles: usize,
+    /// Records jobs that are active and have available units remaining.
     global_advertise_mask: AtomicBits,
     /// Shared information about scheduled jobs. Threads reserve slots in this
     /// array using the [`Self::running_jobs`] member. Other threads can
     /// then search this array to look for work.
     jobs: Vec<JobSlot>,
+    /// The total number of worker threads in the pool.
     num_threads: usize,
     /// An event that is invoked whenever new work is available.
     on_change: Event,
+    /// Tracks which slots in [`Self::jobs`] are currently reserved.
     running_jobs: AtomicBits,
     /// Whether the parent [`ThreadPool`] is being dropped.
     /// This indicates that workers should exit.
