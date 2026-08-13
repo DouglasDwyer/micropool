@@ -217,6 +217,13 @@ where
     ThreadPool::with_current(|pool| pool.join(oper_a, oper_b))
 }
 
+/// Takes multiple closures and *potentially* runs them in parallel. It
+/// returns a tuple of the results from those closures.
+#[allow(private_bounds, private_interfaces)]
+pub fn join_all<T: JoinAll>(opers: T) -> T::Result {
+    ThreadPool::with_current(|pool| pool.join_all(opers))
+}
+
 /// The total number of worker threads in the current pool.
 pub fn num_threads() -> usize {
     ThreadPool::with_current(|pool| pool.num_threads())
