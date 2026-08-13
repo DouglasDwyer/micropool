@@ -10,8 +10,6 @@ use paralight::iter::{Accumulator, ExactSizeAccumulator, GenericThreadPool, Sour
 pub use self::task::*;
 pub use self::thread_pool::*;
 
-//mod job_block;
-
 /// Implementation of tasks for the [`spawn`] API.
 mod task;
 
@@ -219,7 +217,6 @@ where
 
 /// Takes multiple closures and *potentially* runs them in parallel. It
 /// returns a tuple of the results from those closures.
-#[allow(private_bounds, private_interfaces)]
 pub fn join_all<T: JoinAll>(opers: T) -> T::Result {
     ThreadPool::with_current(|pool| pool.join_all(opers))
 }

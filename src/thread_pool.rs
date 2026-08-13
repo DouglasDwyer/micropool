@@ -13,6 +13,7 @@ use smallvec::SmallVec;
 
 use crate::util::*;
 use crate::{OwnedTask, SharedTask, TaskInner};
+pub(crate) use self::private::JoinAll;
 
 /// The global thread pool.
 static GLOBAL_POOL: spin::Once<ThreadPool> = spin::Once::new();
@@ -238,7 +239,6 @@ impl ThreadPool {
 
     /// Takes multiple closures and *potentially* runs them in parallel. It
     /// returns a tuple of the results from those closures.
-    #[allow(private_bounds, private_interfaces)]
     pub fn join_all<T: JoinAll>(&self, opers: T) -> T::Result {
         unsafe {
             let function_holder = opers.to_function_holder();
@@ -304,119 +304,6 @@ impl Drop for ThreadPool {
     }
 }
 
-/// Allows for executing multiple functions in parallel, even if they have
-/// different types.
-pub(crate) trait JoinAll: Send {
-    /// The number of closures in this tuple.
-    const LEN: usize;
-
-    /// Stores a [`MaybeUninit`] for each function in this tuple.
-    /// This allows for transferring the functions in parallel to other threads.
-    type FunctionHolder;
-
-    /// A tuple of the results from executing each function.
-    type Result: Send;
-
-    /// Stores an [`UnsafeCell<MaybeUninit>`] for each function in this tuple.
-    /// This allows for writing the function results in parallel.
-    type ResultHolder;
-
-    /// Consumes the function at index `i` in the holder, and writes the
-    /// associated result.
-    ///
-    /// # Safety
-    ///
-    /// For this function call to be sound, it must be invoked at most once on
-    /// each value of `i` between `0..Self::LEN`.
-    unsafe fn invoke(
-        function_holder: &Self::FunctionHolder,
-        result_holder: &Self::ResultHolder,
-        i: usize,
-    );
-
-    /// Unwraps the result tuple once all functions have finished.
-    ///
-    /// # Safety
-    ///
-    /// For this function call to be sound, [`Self::invoke`] must have
-    /// successfully completed execution for values `0..Self::LEN`.
-    unsafe fn result_assume_init(result: Self::ResultHolder) -> Self::Result;
-
-    /// Gets a holder to store the in-progress results from executing these
-    /// functions.
-    fn result_holder() -> Self::ResultHolder;
-
-    /// Wraps the closures into a function holder that allows accessing them in
-    /// parallel.
-    fn to_function_holder(self) -> Self::FunctionHolder;
-}
-
-/// Counts the identifiers given at compile-time.
-macro_rules! count_join_all {
-    () => (0usize);
-    ($head:ident $(, $tail:ident)*) => (1usize + count_join_all!($($tail),*));
-}
-
-/// Implements [`JoinAll`] for one specific tuple arity.
-///
-/// Invoke as `impl_join_all!(A:RA:0, B:RB:1, C:RC:2, ...)` — each entry is
-/// `ClosureType : ResultType : literal_tuple_index`.
-macro_rules! impl_join_all {
-    ( $( $ty:ident : $res:ident : $idx:tt ),* $(,)? ) => {
-        #[allow(unused_unsafe, unused_variables)]
-        impl<$($ty,)* $($res,)*> JoinAll for ($($ty,)*)
-        where
-            $( $ty: FnOnce() -> $res + Send, )*
-            $( $res: Send, )*
-        {
-            const LEN: usize = count_join_all!($($ty),*);
-
-            type FunctionHolder = ( $( MaybeUninit<$ty>, )* );
-            type Result = ( $($res,)* );
-            type ResultHolder = ( $( UnsafeCell<MaybeUninit<$res>>, )* );
-
-            unsafe fn invoke(function_holder: &Self::FunctionHolder, result_holder: &Self::ResultHolder, i: usize) {
-                // Safety: the `i`th function has not been accessed by any other invocation according to the function invariant
-                unsafe {
-                    match i {
-                        $(
-                            $idx => {
-                                result_holder.$idx.get().as_mut_unchecked()
-                                    .write(function_holder.$idx.assume_init_read()());
-                            }
-                        )*
-                        _ => unreachable_unchecked(),
-                    }
-                }
-            }
-
-            unsafe fn result_assume_init(result: Self::ResultHolder) -> Self::Result {
-                // Safety: all of the results have been written according to the function invariant
-                unsafe {
-                    ( $( result.$idx.into_inner().assume_init(), )* )
-                }
-            }
-
-            fn to_function_holder(self) -> Self::FunctionHolder {
-                ( $( MaybeUninit::new(self.$idx), )* )
-            }
-
-            fn result_holder() -> Self::ResultHolder {
-                ( $( UnsafeCell::new(MaybeUninit::<$res>::uninit()), )* )
-            }
-        }
-    };
-}
-
-impl_join_all!();
-impl_join_all!(A:RA:0);
-impl_join_all!(A:RA:0, B:RB:1);
-impl_join_all!(A:RA:0, B:RB:1, C:RC:2);
-impl_join_all!(A:RA:0, B:RB:1, C:RC:2, D:RD:3);
-impl_join_all!(A:RA:0, B:RB:1, C:RC:2, D:RD:3, E:RE:4);
-impl_join_all!(A:RA:0, B:RB:1, C:RC:2, D:RD:3, E:RE:4, F:RF:5);
-impl_join_all!(A:RA:0, B:RB:1, C:RC:2, D:RD:3, E:RE:4, F:RF:5, G:RG:6);
-impl_join_all!(A:RA:0, B:RB:1, C:RC:2, D:RD:3, E:RE:4, F:RF:5, G:RG:6, H:RH:7);
 
 /// Implementation for [`ThreadPool::split_per_item`].
 struct SplitPerItem<'a>(&'a ThreadPool);
@@ -1122,4 +1009,123 @@ impl Iterator for AtomicBitsIter<'_> {
         self.current_value &= (u64::MAX << 1) << bit;
         Some(self.base_index + bit as usize)
     }
+}
+
+/// Hidden implementation details.
+mod private {
+    use super::*;
+
+    /// Allows for executing multiple functions in parallel, even if they have
+    /// different types.
+    pub trait JoinAll: Send {
+        /// The number of closures in this tuple.
+        const LEN: usize;
+
+        /// Stores a [`MaybeUninit`] for each function in this tuple.
+        /// This allows for transferring the functions in parallel to other threads.
+        type FunctionHolder;
+
+        /// A tuple of the results from executing each function.
+        type Result: Send;
+
+        /// Stores an [`UnsafeCell<MaybeUninit>`] for each function in this tuple.
+        /// This allows for writing the function results in parallel.
+        type ResultHolder;
+
+        /// Consumes the function at index `i` in the holder, and writes the
+        /// associated result.
+        ///
+        /// # Safety
+        ///
+        /// For this function call to be sound, it must be invoked at most once on
+        /// each value of `i` between `0..Self::LEN`.
+        unsafe fn invoke(
+            function_holder: &Self::FunctionHolder,
+            result_holder: &Self::ResultHolder,
+            i: usize,
+        );
+
+        /// Unwraps the result tuple once all functions have finished.
+        ///
+        /// # Safety
+        ///
+        /// For this function call to be sound, [`Self::invoke`] must have
+        /// successfully completed execution for values `0..Self::LEN`.
+        unsafe fn result_assume_init(result: Self::ResultHolder) -> Self::Result;
+
+        /// Gets a holder to store the in-progress results from executing these
+        /// functions.
+        fn result_holder() -> Self::ResultHolder;
+
+        /// Wraps the closures into a function holder that allows accessing them in
+        /// parallel.
+        fn to_function_holder(self) -> Self::FunctionHolder;
+    }
+
+    /// Counts the identifiers given at compile-time.
+    macro_rules! count_join_all {
+        () => (0usize);
+        ($head:ident $(, $tail:ident)*) => (1usize + count_join_all!($($tail),*));
+    }
+
+    /// Implements [`JoinAll`] for one specific tuple arity.
+    ///
+    /// Invoke as `impl_join_all!(A:RA:0, B:RB:1, C:RC:2, ...)` — each entry is
+    /// `ClosureType : ResultType : literal_tuple_index`.
+    macro_rules! impl_join_all {
+        ( $( $ty:ident : $res:ident : $idx:tt ),* $(,)? ) => {
+            #[allow(unused_unsafe, unused_variables)]
+            impl<$($ty,)* $($res,)*> JoinAll for ($($ty,)*)
+            where
+                $( $ty: FnOnce() -> $res + Send, )*
+                $( $res: Send, )*
+            {
+                const LEN: usize = count_join_all!($($ty),*);
+
+                type FunctionHolder = ( $( MaybeUninit<$ty>, )* );
+                type Result = ( $($res,)* );
+                type ResultHolder = ( $( UnsafeCell<MaybeUninit<$res>>, )* );
+
+                unsafe fn invoke(function_holder: &Self::FunctionHolder, result_holder: &Self::ResultHolder, i: usize) {
+                    // Safety: the `i`th function has not been accessed by any other invocation according to the function invariant
+                    unsafe {
+                        match i {
+                            $(
+                                $idx => {
+                                    result_holder.$idx.get().as_mut_unchecked()
+                                        .write(function_holder.$idx.assume_init_read()());
+                                }
+                            )*
+                            _ => unreachable_unchecked(),
+                        }
+                    }
+                }
+
+                unsafe fn result_assume_init(result: Self::ResultHolder) -> Self::Result {
+                    // Safety: all of the results have been written according to the function invariant
+                    unsafe {
+                        ( $( result.$idx.into_inner().assume_init(), )* )
+                    }
+                }
+
+                fn to_function_holder(self) -> Self::FunctionHolder {
+                    ( $( MaybeUninit::new(self.$idx), )* )
+                }
+
+                fn result_holder() -> Self::ResultHolder {
+                    ( $( UnsafeCell::new(MaybeUninit::<$res>::uninit()), )* )
+                }
+            }
+        };
+    }
+
+    impl_join_all!();
+    impl_join_all!(A:RA:0);
+    impl_join_all!(A:RA:0, B:RB:1);
+    impl_join_all!(A:RA:0, B:RB:1, C:RC:2);
+    impl_join_all!(A:RA:0, B:RB:1, C:RC:2, D:RD:3);
+    impl_join_all!(A:RA:0, B:RB:1, C:RC:2, D:RD:3, E:RE:4);
+    impl_join_all!(A:RA:0, B:RB:1, C:RC:2, D:RD:3, E:RE:4, F:RF:5);
+    impl_join_all!(A:RA:0, B:RB:1, C:RC:2, D:RD:3, E:RE:4, F:RF:5, G:RG:6);
+    impl_join_all!(A:RA:0, B:RB:1, C:RC:2, D:RD:3, E:RE:4, F:RF:5, G:RG:6, H:RH:7);
 }
